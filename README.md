@@ -2,9 +2,9 @@
 ```markdown
 
 
-🔥 نصب و اجرا با یک خط دستور
+## 🔥 نصب و اجرا با یک خط دستور
 
-کافیست این دستور را در ترمینال خود اجرا کنید:
+## کافیست این دستور را در ترمینال خود اجرا کنید:
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/coderuseplayer-netizen/subscriptionlink-panel-DoS-ATTACK/main/install.sh)"
