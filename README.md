@@ -1,26 +1,3 @@
-# subscriptionlink-panel-DoS-ATTACK
-
-
-```markdown
-# ⚡ ابزار تست استرس پنل لینک اشتراک ⚡
-
-> **چهارچوب پیشرفته نابودی هدف**  
-> ابزاری قدرتمند، چند‌برداری و تطبیقی برای تست استرس لایه ۷ که برای ارزیابی امنیتی و سنجش مقاومت پنل‌های لینک اشتراک (مانند V2Ray، Clash، Sing-box) و سرویس‌های مشابه طراحی شده است.
-
----
-
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.8%2B-blue?style=for-the-badge&logo=python&logoColor=white" alt="Python"/>
-  <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge&logo=open-source-initiative&logoColor=white" alt="License"/>
-  <img src="https://img.shields.io/badge/Version-1.0.0-red?style=for-the-badge&logo=github&logoColor=white" alt="Version"/>
-  <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey?style=for-the-badge&logo=linux&logoColor=white" alt="Platform"/>
-</p>
-
----
-
-## 🔥 نصب و اجرا با یک خط دستور
-
-کافیست این دستور را در ترمینال خود اجرا کنید:
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/coderuseplayer-netizen/subscriptionlink-panel-DoS-ATTACK/main/install.sh)"
