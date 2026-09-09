@@ -1,6 +1,5 @@
 
-```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/coderuseplayer-netizen/subscriptionlink-panel-DoS-ATTACK/main/install.sh)"
+
 ```
 
 اسکریپت نصب به صورت خودکار:
@@ -12,7 +11,8 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/coderuseplayer-netizen/s
 - شروع منوی تعاملی
 
 ---
-
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/coderuseplayer-netizen/subscriptionlink-panel-DoS-ATTACK/main/install.sh)"
 ## 🧠 این ابزار چیست؟
 
 این ابزار یک **چهارچوب تست استرس لایه ۷ چند‌برداری و تطبیقی** است که به طور خاص برای ارزیابی مقاومت پنل‌های لینک اشتراک (مانند V2Ray، Clash، Sing-box) که فایل‌های کانفیگ را از طریق URL تحویل می‌دهند، طراحی شده است. این ابزار با شبیه‌سازی هزاران درخواست همزمان از طرف کلاینت‌ها، نحوه عملکرد سرور را تحت بار بالا، رقابت دیتابیس، دور زدن کش، و اشباع ظرفیت اتصالات بررسی می‌کند.
