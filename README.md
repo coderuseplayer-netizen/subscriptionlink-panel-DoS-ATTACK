@@ -7,7 +7,7 @@
 کافیست این دستور را در ترمینال خود اجرا کنید:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/coderuseplayer-netizen/subscriptionlink-panel-DoS-ATTACK/main/install.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/coderuseplayer-netizen/subscriptionlink-panel-DoS-ATTACK/main/install.sh)"
 ```
 
 ## 🧠 این ابزار چیست؟
