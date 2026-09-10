@@ -43,7 +43,7 @@ echo "=== Running Python script with socket limit 10000 ==="
 # Ensure the limit is inherited by the Python process
 if [ "$(id -u)" -eq 0 ]; then
     # Already root, set limit directly
-    ulimit -n 10000
+    ulimit -n 65535
     python3 run.py
 else
     # Not root, try to set limit then run; if fails, use sudo to run with higher limit
