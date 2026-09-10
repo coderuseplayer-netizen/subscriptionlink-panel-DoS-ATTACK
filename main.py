@@ -383,9 +383,9 @@ def get_target_url():
 def main_menu():
     print_banner()
     print(f"{Colors.BOLD}Choose Your Weapon:{Colors.RESET}")
-    print(f" [{Colors.CYAN}1{Colors.RESET}] Saturation Bombardment")
+    print(f" [{Colors.CYAN}1{Colors.RESET}] Saturation Bombardment (recommended)")
     print(f" [{Colors.MAGENTA}2{Colors.RESET}] Database Annihilation & Lock Exploitation")
-    print(f" [{Colors.CYAN}3{Colors.RESET}] Cache Obliteration & Shield Piercing")
+    print(f" [{Colors.CYAN}3{Colors.RESET}] Cache Obliteration & Shield Piercing(BETA Not recommended)")
     print(f" [{Colors.RED}0{Colors.RESET}] Exit\n")
 
     choice = input(f"{Colors.BOLD}Choose weapon [1]: {Colors.RESET}").strip() or "1"
