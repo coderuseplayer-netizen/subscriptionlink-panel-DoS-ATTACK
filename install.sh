@@ -1,11 +1,55 @@
 #!/bin/bash
 
-# Exit on critical error
-set -e
+# ============================================================
+#    SUB/URL ATTACK — Setup & Dependency Installer
+# ============================================================
 
-echo "=== Starting setup and prerequisites installation ==="
+# Colors
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
+C_RED='\033[91m'
+C_GREEN='\033[92m'
+C_YELLOW='\033[93m'
+C_BLUE='\033[94m'
+C_MAGENTA='\033[95m'
+C_CYAN='\033[96m'
+C_WHITE='\033[97m'
 
-# 1. Detect OS and package manager
+# UI helpers
+ok()    { echo -e "  ${C_GREEN}✓${C_RESET} $1"; }
+warn()  { echo -e "  ${C_YELLOW}⚠${C_RESET} $1"; }
+err()   { echo -e "  ${C_RED}✗${C_RESET} $1"; }
+info()  { echo -e "  ${C_CYAN}➜${C_RESET} $1"; }
+dim()   { echo -e "  ${C_DIM}$1${C_RESET}"; }
+
+section() {
+    echo ""
+    echo -e "  ${C_BOLD}${C_MAGENTA}● $1${C_RESET}"
+    echo -e "  ${C_DIM}────────────────────────────────────────────────${C_RESET}"
+}
+
+print_banner() {
+    clear 2>/dev/null || true
+    cat <<EOF
+
+${C_CYAN}${C_BOLD}
+  ██╗   ██╗██████╗ ██╗          █████╗ ████████╗████████╗ █████╗  ██████╗██╗  ██╗
+  ██║   ██║██╔══██╗██║         ██╔══██╗╚══██╔══╝╚══██╔══╝██╔══██╗██╔════╝██║ ██╔╝
+  ██║   ██║██████╔╝██║         ███████║   ██║      ██║   ███████║██║     █████╔╝ 
+  ██║   ██║██╔══██╗██║         ██╔══██║   ██║      ██║   ██╔══██║██║     ██╔═██╗ 
+  ╚██████╔╝██║  ██║███████╗    ██║  ██║   ██║      ██║   ██║  ██║╚██████╗██║  ██╗
+   ╚═════╝ ╚═╝  ╚═╝╚══════╝    ╚═╝  ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝
+${C_RESET}${C_BOLD}${C_MAGENTA}                  [ SETUP & DEPENDENCY INSTALLER ]
+${C_DIM}                  Advanced Target Extermination Framework${C_RESET}
+
+EOF
+}
+
+print_banner
+
+section "SYSTEM DETECTION"
+
 PKG_MGR=""
 if command -v apt &> /dev/null; then
     PKG_MGR="apt"
@@ -18,164 +62,215 @@ elif command -v pacman &> /dev/null; then
 elif command -v apk &> /dev/null; then
     PKG_MGR="apk"
 else
-    echo "[!] No supported package manager found (apt/yum/dnf/pacman/apk)"
+    err "No supported package manager found (apt/yum/dnf/pacman/apk)"
     exit 1
 fi
 
-echo "[+] Detected package manager: $PKG_MGR"
+ok "Package manager: ${C_BOLD}$PKG_MGR${C_RESET}"
 
-# 2. Install system dependencies
-echo "[+] Installing Python3, pip and networking tools..."
+if [ "$(id -u)" -eq 0 ]; then
+    ok "Running as root"
+    SUDO=""
+else
+    warn "Running as non-root — sudo required for system changes"
+    SUDO="sudo"
+fi
+
+section "INSTALLING SYSTEM DEPENDENCIES"
+
 case "$PKG_MGR" in
     apt)
-        sudo apt update -y
-        sudo apt install -y python3 python3-pip python3-venv curl wget ca-certificates
+        info "Updating repositories..."
+        $SUDO apt update -y >/dev/null 2>&1
+        info "Installing python3, pip, curl, wget, ca-certificates..."
+        $SUDO apt install -y python3 python3-pip python3-venv curl wget ca-certificates >/dev/null 2>&1
         ;;
     yum)
-        sudo yum install -y python3 python3-pip curl wget ca-certificates
+        info "Installing python3, pip, curl, wget..."
+        $SUDO yum install -y python3 python3-pip curl wget ca-certificates >/dev/null 2>&1
         ;;
     dnf)
-        sudo dnf install -y python3 python3-pip curl wget ca-certificates
+        info "Installing python3, pip, curl, wget..."
+        $SUDO dnf install -y python3 python3-pip curl wget ca-certificates >/dev/null 2>&1
         ;;
     pacman)
-        sudo pacman -Sy --noconfirm python python-pip curl wget ca-certificates
+        info "Installing python, pip, curl, wget..."
+        $SUDO pacman -Sy --noconfirm python python-pip curl wget ca-certificates >/dev/null 2>&1
         ;;
     apk)
-        sudo apk add --no-cache python3 py3-pip curl wget ca-certificates
+        info "Installing python3, pip, curl, wget..."
+        $SUDO apk add --no-cache python3 py3-pip curl wget ca-certificates >/dev/null 2>&1
         ;;
 esac
 
-# 3. Verify Python version
+ok "System dependencies installed"
+
+section "PYTHON VERSION CHECK"
+
 PYVER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-echo "[+] Python version: $PYVER"
+ok "Python version: ${C_BOLD}$PYVER${C_RESET}"
 
 if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)'; then
-    echo "[!] Python 3.8+ is required. Current: $PYVER"
+    err "Python 3.8+ is required. Current: $PYVER"
     exit 1
 fi
 
-# 4. Install Python dependencies (aiohttp + aiohttp-socks)
-echo "[+] Installing Python packages: aiohttp, aiohttp-socks..."
+ok "Version requirement satisfied"
+
+section "INSTALLING PYTHON PACKAGES"
 
 install_py_pkg() {
     local pkg="$1"
-    # Try with --break-system-packages first (for Kali/Debian with PEP 668)
     if pip3 install "$pkg" --break-system-packages --quiet 2>/dev/null; then
         return 0
     fi
-    # Try normal pip install
     if pip3 install "$pkg" --quiet 2>/dev/null; then
         return 0
     fi
-    # Try with --user
     if pip3 install "$pkg" --user --quiet 2>/dev/null; then
         return 0
     fi
-    # Try with sudo + --break-system-packages
-    if sudo pip3 install "$pkg" --break-system-packages --quiet 2>/dev/null; then
+    if $SUDO pip3 install "$pkg" --break-system-packages --quiet 2>/dev/null; then
         return 0
     fi
     return 1
 }
 
-for pkg in aiohttp aiohttp-socks; do
-    echo "    -> Installing $pkg..."
+for pkg in aiohttp aiohttp-socks brotli; do
+    info "Installing ${C_BOLD}$pkg${C_RESET}..."
     if install_py_pkg "$pkg"; then
-        echo "    [✓] $pkg installed"
+        ok "$pkg installed"
     else
-        echo "    [!] Failed to install $pkg automatically"
-        echo "    Try manually: pip3 install $pkg --break-system-packages"
+        err "Failed to install $pkg"
+        dim "Try manually: pip3 install $pkg --break-system-packages"
     fi
 done
 
-# 5. Verify imports
-echo "[+] Verifying Python imports..."
-python3 - <<'PYEOF'
+section "VERIFYING IMPORTS"
+
+VERIFY_RESULT=$(python3 - <<'PYEOF'
 import sys
 missing = []
-for mod in ("aiohttp", "aiohttp_socks"):
+for mod in ("aiohttp", "aiohttp_socks", "brotli"):
     try:
         __import__(mod)
-        print(f"    [✓] {mod}")
+        print(f"OK:{mod}")
     except ImportError:
-        print(f"    [!] {mod} NOT available")
+        print(f"MISS:{mod}")
         missing.append(mod)
-if missing:
-    sys.exit(1)
+sys.exit(1 if missing else 0)
 PYEOF
+)
 
-if [ $? -ne 0 ]; then
-    echo "[!] Missing Python packages. Aborting."
+echo "$VERIFY_RESULT" | while IFS=: read -r status mod; do
+    if [ "$status" = "OK" ]; then
+        ok "$mod"
+    elif [ "$status" = "MISS" ]; then
+        err "$mod ${C_RED}NOT available${C_RESET}"
+    fi
+done
+
+if echo "$VERIFY_RESULT" | grep -q "^MISS:"; then
+    err "Missing Python packages. Aborting."
     exit 1
 fi
 
-# 6. Raise file descriptor / socket limits
-echo "[+] Raising socket and file descriptor limits..."
+ok "All Python packages verified"
+
+section "RAISING FILE DESCRIPTOR LIMITS"
 
 TARGET_LIMIT=65535
 
-# Try to set for current shell
-ulimit -n "$TARGET_LIMIT" 2>/dev/null && echo "    [✓] Soft limit set to $TARGET_LIMIT" \
-    || echo "    [!] Could not set soft limit in current shell"
+if ulimit -n "$TARGET_LIMIT" 2>/dev/null; then
+    ok "Soft limit set to ${C_BOLD}$TARGET_LIMIT${C_RESET}"
+else
+    warn "Could not set soft limit in current shell"
+fi
 
-# Try to set hard limit
-ulimit -Hn "$TARGET_LIMIT" 2>/dev/null && echo "    [✓] Hard limit set to $TARGET_LIMIT" \
-    || echo "    [!] Could not set hard limit (may require root)"
+if ulimit -Hn "$TARGET_LIMIT" 2>/dev/null; then
+    ok "Hard limit set to ${C_BOLD}$TARGET_LIMIT${C_RESET}"
+else
+    warn "Could not set hard limit (may require root)"
+fi
 
-# Persist limit in /etc/security/limits.conf if not already present
 if [ -w /etc/security/limits.conf ] || [ "$(id -u)" -eq 0 ]; then
     if ! grep -q "sub-attack-nofile" /etc/security/limits.conf 2>/dev/null; then
-        echo "    [*] Adding permanent limits to /etc/security/limits.conf..."
+        info "Adding permanent limits to /etc/security/limits.conf..."
         {
             echo "* soft nofile $TARGET_LIMIT  # sub-attack-nofile"
             echo "* hard nofile $TARGET_LIMIT  # sub-attack-nofile"
-        } | sudo tee -a /etc/security/limits.conf > /dev/null
-        echo "    [✓] Permanent limits added (re-login required)"
+        } | $SUDO tee -a /etc/security/limits.conf > /dev/null
+        ok "Permanent limits added ${C_DIM}(re-login required)${C_RESET}"
     else
-        echo "    [✓] Permanent limits already configured"
+        ok "Permanent limits already configured"
     fi
 fi
 
-# 7. Tune TCP stack for high concurrency (optional, requires root)
+section "TCP STACK TUNING"
+
 if [ "$(id -u)" -eq 0 ]; then
-    echo "[+] Tuning TCP stack for high-concurrency networking..."
-    sysctl -w net.ipv4.tcp_fin_timeout=15 >/dev/null 2>&1 && echo "    [✓] tcp_fin_timeout=15"
-    sysctl -w net.ipv4.tcp_tw_reuse=1 >/dev/null 2>&1 && echo "    [✓] tcp_tw_reuse=1"
-    sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1 && echo "    [✓] ip_local_port_range widened"
-    sysctl -w net.ipv4.tcp_max_syn_backlog=65535 >/dev/null 2>&1 && echo "    [✓] tcp_max_syn_backlog raised"
-    sysctl -w fs.file-max=2097152 >/dev/null 2>&1 && echo "    [✓] fs.file-max raised"
+    info "Tuning TCP stack for high-concurrency networking..."
+
+    sysctl -w net.ipv4.tcp_fin_timeout=15 >/dev/null 2>&1 \
+        && ok "tcp_fin_timeout = 15" \
+        || warn "tcp_fin_timeout tuning failed"
+
+    sysctl -w net.ipv4.tcp_tw_reuse=1 >/dev/null 2>&1 \
+        && ok "tcp_tw_reuse = 1" \
+        || warn "tcp_tw_reuse tuning failed"
+
+    sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1 \
+        && ok "ip_local_port_range widened" \
+        || warn "ip_local_port_range tuning failed"
+
+    sysctl -w net.ipv4.tcp_max_syn_backlog=65535 >/dev/null 2>&1 \
+        && ok "tcp_max_syn_backlog raised" \
+        || warn "tcp_max_syn_backlog tuning failed"
+
+    sysctl -w fs.file-max=2097152 >/dev/null 2>&1 \
+        && ok "fs.file-max raised" \
+        || warn "fs.file-max tuning failed"
 else
-    echo "[!] Skipping TCP stack tuning (requires root)"
+    warn "Skipping TCP stack tuning (requires root)"
 fi
 
-# 8. Download the main Python script from the repository
+section "DOWNLOADING MAIN SCRIPT"
+
 RAW_PYTHON_URL="https://raw.githubusercontent.com/coderuseplayer-netizen/subscriptionlink-panel-DoS-ATTACK/main/main.py"
 SCRIPT_FILE="run.py"
 
-echo "[+] Downloading main script from repository..."
+info "Downloading from repository..."
 if curl -fsSL "$RAW_PYTHON_URL" -o "$SCRIPT_FILE"; then
-    echo "    [✓] Downloaded to $SCRIPT_FILE"
+    ok "Downloaded to ${C_BOLD}$SCRIPT_FILE${C_RESET}"
 else
-    echo "    [!] Failed to download script from $RAW_PYTHON_URL"
+    err "Failed to download from $RAW_PYTHON_URL"
     exit 1
 fi
 
 chmod +x "$SCRIPT_FILE"
+ok "Script marked as executable"
 
-# 9. Run the Python script
+section "LAUNCHING"
+
 echo ""
-echo "=== Setup complete. Launching attack framework ==="
-echo "    Socket limit: $(ulimit -n)"
+echo -e "  ${C_BOLD}${C_GREEN}● SETUP COMPLETE${C_RESET}"
+echo -e "  ${C_DIM}├─${C_RESET} Socket limit   ${C_BOLD}$(ulimit -n)${C_RESET}"
+echo -e "  ${C_DIM}├─${C_RESET} Script         ${C_BOLD}$SCRIPT_FILE${C_RESET}"
+echo -e "  ${C_DIM}└─${C_RESET} Status         ${C_GREEN}Ready${C_RESET}"
 echo ""
+echo -e "  ${C_DIM}────────────────────────────────────────────────${C_RESET}"
+echo ""
+
+sleep 1
 
 if [ "$(id -u)" -eq 0 ]; then
-    ulimit -n "$TARGET_LIMIT"
+    ulimit -n "$TARGET_LIMIT" 2>/dev/null
     python3 "$SCRIPT_FILE"
 else
     if ulimit -n "$TARGET_LIMIT" 2>/dev/null; then
         python3 "$SCRIPT_FILE"
     else
-        echo "[!] Could not raise ulimit. Re-running with sudo..."
-        sudo bash -c "ulimit -n $TARGET_LIMIT && python3 $SCRIPT_FILE"
+        info "Re-running with sudo..."
+        $SUDO bash -c "ulimit -n $TARGET_LIMIT && python3 $SCRIPT_FILE"
     fi
 fi
