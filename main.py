@@ -52,11 +52,15 @@ def _restore_terminal():
 
 
 def _sigint_handler(signum, frame):
+    """
+    Only set the flag. Do NOT raise inside asyncio — it corrupts the loop.
+    If we're outside asyncio (blocked on input()), safe to raise.
+    """
     _INTERRUPTED[0] = True
     _restore_terminal()
     try:
         asyncio.get_running_loop()
-        return
+        return  # inside asyncio → flag is enough
     except RuntimeError:
         raise KeyboardInterrupt()
 
@@ -68,6 +72,7 @@ except Exception:
 
 
 async def interruptible_sleep(seconds):
+    """Sleep that wakes up quickly when _INTERRUPTED is set."""
     end = time.time() + seconds
     while time.time() < end:
         if _INTERRUPTED[0]:
@@ -222,6 +227,7 @@ def pick_proxy():
 
 
 def _sync_connect(proxy, host, port, use_ssl, timeout):
+    """Returns a PLAIN TCP socket. SSL handshake is done by asyncio later."""
     if proxy is None:
         s = _socket.create_connection((host, port), timeout=timeout)
         s.setblocking(False)
@@ -327,7 +333,7 @@ class Session:
             )
         else:
             self.reader, self.writer = await asyncio.open_connection(sock=sock)
-            
+
     async def close(self):
         if self.writer is not None:
             try:
@@ -678,6 +684,7 @@ def random_string(length=12):
 
 class LiveDashboard:
     _THROTTLE_SEC = 3
+    _MAX_PROXY_ROWS = 10
 
     def __init__(self):
         self.enabled = False
@@ -813,11 +820,6 @@ class LiveDashboard:
         self._rendering = True
 
         try:
-            try:
-                term_rows = os.get_terminal_size().lines
-            except (OSError, AttributeError):
-                term_rows = 40
-
             lines = []
             lines.append("")
             lines.append(f"  {Colors.BOLD}{Colors.RED}● BLACKOUT · LIVE ATTACK DASHBOARD{Colors.RESET}")
@@ -902,6 +904,9 @@ class LiveDashboard:
                     )
                 lines.append("")
 
+            # ============================================================
+            #  PROXY POOL — capped at _MAX_PROXY_ROWS to keep fixed height
+            # ============================================================
             try:
                 proxy_sessions = list(PROXY_MANAGER.sessions.keys())
             except Exception:
@@ -912,26 +917,22 @@ class LiveDashboard:
                     st = PROXY_MANAGER.proxy_stats.get(p, {})
                     if not st.get("dead", False):
                         alive_cnt += 1
-
                 lines.append(
                     f"  {Colors.BOLD}{Colors.MAGENTA}● PROXY POOL{Colors.RESET}  "
                     f"{Colors.DIM}(mode: {PROXY_MANAGER.rotation_mode} · "
                     f"{alive_cnt} alive / {len(proxy_sessions)} total){Colors.RESET}"
                 )
 
-                # FIX: cap proxy rows to keep dashboard fixed-size
-                MAX_PROXY_ROWS = 5
                 sorted_proxies = sorted(
                     proxy_sessions,
                     key=lambda p: PROXY_MANAGER.proxy_stats.get(p, {}).get("requests", 0),
                     reverse=True,
                 )
-                shown = sorted_proxies[:MAX_PROXY_ROWS]
-                remaining_count = len(sorted_proxies) - len(shown)
+                shown = sorted_proxies[:self._MAX_PROXY_ROWS]
+                remaining = len(sorted_proxies) - len(shown)
 
                 for i, p in enumerate(shown):
-                    # last shown row: use └─ only if nothing else comes after it
-                    is_last = (i == len(shown) - 1) and (remaining_count == 0)
+                    is_last = (i == len(shown) - 1) and (remaining == 0)
                     prefix = "└─" if is_last else "├─"
                     st = PROXY_MANAGER.proxy_stats.get(p, {})
                     req = st.get("requests", 0)
@@ -954,11 +955,11 @@ class LiveDashboard:
                         f"{Colors.DIM}{lat:>4}ms{Colors.RESET}"
                     )
 
-                if remaining_count > 0:
+                if remaining > 0:
                     lines.append(
                         f"  {Colors.DIM}└─{Colors.RESET} "
-                        f"{Colors.DIM}... and {remaining_count} more proxies "
-                        f"(top {MAX_PROXY_ROWS} by req count){Colors.RESET}"
+                        f"{Colors.DIM}... and {remaining} more proxies "
+                        f"(top {self._MAX_PROXY_ROWS} by req count){Colors.RESET}"
                     )
 
                 lines.append("")
@@ -977,12 +978,8 @@ class LiveDashboard:
                 lines.append("")
 
             if self.recent_logs:
-                max_logs = 8
-                if term_rows < 35:
-                    max_logs = 4
-                logs_to_show = self.recent_logs[-max_logs:]
                 lines.append(f"  {Colors.BOLD}● RECENT ACTIVITY{Colors.RESET}")
-                for status_type, msg, ts in logs_to_show:
+                for status_type, msg, ts in self.recent_logs:
                     ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
                     pfx = self._log_prefix(status_type)
                     lines.append(f"  {Colors.DIM}{ts_str}{Colors.RESET}  {pfx}  {msg}")
@@ -1234,6 +1231,8 @@ class ProxyManager:
                     pass
 
     async def validate_all(self):
+        """Validate all proxies with a single-line progress bar.
+        No per-proxy DEAD/ALIVE spam — only final summary is printed."""
         if not self.all_proxies:
             return 0, 0, "No proxies loaded"
 
@@ -1271,7 +1270,6 @@ class ProxyManager:
                 f"[{bar}]  {pct:>3}%"
             )
 
-        # initial render of progress line
         if is_tty:
             sys.stdout.write(_progress_line())
             sys.stdout.flush()
@@ -1341,7 +1339,6 @@ class ProxyManager:
             else:
                 self.dead_proxies.append(p)
 
-        # Summary only — no per-proxy output
         print(f"  {Colors.BOLD}● RESULT{Colors.RESET}")
         print(f"  {Colors.DIM}├─{Colors.RESET} Total      "
               f"{Colors.BOLD}{total}{Colors.RESET}")
