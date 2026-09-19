@@ -1,10 +1,9 @@
 #!/bin/bash
 
 # ============================================================
-#    SUB/URL ATTACK — Setup & Dependency Installer
+#    BLACKOUT — Setup & Dependency Installer
 # ============================================================
 
-# Colors
 C_RESET='\033[0m'
 C_BOLD='\033[1m'
 C_DIM='\033[2m'
@@ -16,7 +15,6 @@ C_MAGENTA='\033[95m'
 C_CYAN='\033[96m'
 C_WHITE='\033[97m'
 
-# UI helpers
 ok()    { echo -e "  ${C_GREEN}✓${C_RESET} $1"; }
 warn()  { echo -e "  ${C_YELLOW}⚠${C_RESET} $1"; }
 err()   { echo -e "  ${C_RED}✗${C_RESET} $1"; }
@@ -28,6 +26,20 @@ section() {
     echo -e "  ${C_BOLD}${C_MAGENTA}● $1${C_RESET}"
     echo -e "  ${C_DIM}────────────────────────────────────────────────────${C_RESET}"
 }
+
+clear 2>/dev/null || true
+echo -e "${C_RED}${C_BOLD}"
+cat <<'BANNER'
+  ██████╗ ██╗      █████╗  ██████╗██╗  ██╗ ██████╗ ██╗   ██╗████████╗
+  ██╔══██╗██║     ██╔══██╗██╔════╝██║ ██╔╝██╔═══██╗██║   ██║╚══██╔══╝
+  ██████╔╝██║     ███████║██║     █████╔╝ ██║   ██║██║   ██║   ██║   
+  ██╔══██╗██║     ██╔══██║██║     ██╔═██╗ ██║   ██║██║   ██║   ██║   
+  ██████╔╝███████╗██║  ██║╚██████╗██║  ██╗╚██████╔╝╚██████╔╝   ██║   
+  ╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   
+BANNER
+echo -e "${C_RESET}${C_BOLD}${C_MAGENTA}                  [ PANEL/SUB URL ATTACK ]"
+echo -e "${C_DIM}                  Advanced Target Extermination Framework${C_RESET}"
+echo ""
 
 
 # ============================================================
@@ -61,10 +73,10 @@ else
     SUDO="sudo"
 fi
 
-# Architecture info
 ARCH=$(uname -m)
 ok "Architecture: ${C_BOLD}$ARCH${C_RESET}"
 ok "Kernel: $(uname -r)"
+
 
 # ============================================================
 # 2. INSTALL SYSTEM DEPENDENCIES
@@ -119,6 +131,7 @@ esac
 
 ok "System dependencies installed"
 
+
 # ============================================================
 # 3. PYTHON VERSION CHECK
 # ============================================================
@@ -144,6 +157,7 @@ python3 -m pip install --upgrade pip --quiet 2>/dev/null \
     || python3 -m pip install --upgrade pip --break-system-packages --quiet 2>/dev/null \
     || $SUDO python3 -m pip install --upgrade pip --break-system-packages --quiet 2>/dev/null \
     || warn "Could not upgrade pip — continuing anyway"
+
 
 # ============================================================
 # 4. INSTALL PYTHON PACKAGES
@@ -195,6 +209,7 @@ if [ ${#FAILED_PKGS[@]} -ne 0 ]; then
     done
 fi
 
+
 # ============================================================
 # 5. VERIFYING IMPORTS
 # ============================================================
@@ -232,6 +247,7 @@ else
     ok "All Python packages verified"
 fi
 
+
 # ============================================================
 # 6. RAISE FILE DESCRIPTOR LIMITS
 # ============================================================
@@ -264,6 +280,7 @@ if [ -w /etc/security/limits.conf ] || [ "$(id -u)" -eq 0 ]; then
     fi
 fi
 
+
 # ============================================================
 # 7. TCP STACK TUNING
 # ============================================================
@@ -293,6 +310,7 @@ else
     warn "Skipping TCP stack tuning (requires root)"
 fi
 
+
 # ============================================================
 # 8. ENVIRONMENT SETUP
 # ============================================================
@@ -316,31 +334,57 @@ if ! grep -q "PYTHONDONTWRITEBYTECODE" ~/.bashrc 2>/dev/null; then
     ok "Python bytecode writing disabled"
 fi
 
+
 # ============================================================
-# 9. DOWNLOAD MAIN SCRIPT
+# 9. PREPARE BLACKOUT WORKSPACE
+# ============================================================
+section "PREPARING BLACKOUT WORKSPACE"
+
+BLACKOUT_DIR="$HOME/blackout"
+SCRIPT_FILE="run.py"
+FULL_SCRIPT_PATH="$BLACKOUT_DIR/$SCRIPT_FILE"
+BACKUP_FILE="$BLACKOUT_DIR/run.py.bak"
+
+if [ ! -d "$BLACKOUT_DIR" ]; then
+    mkdir -p "$BLACKOUT_DIR"
+    ok "Created workspace: ${C_BOLD}$BLACKOUT_DIR${C_RESET}"
+else
+    ok "Workspace exists: ${C_BOLD}$BLACKOUT_DIR${C_RESET}"
+fi
+
+cd "$BLACKOUT_DIR" || { err "Failed to enter $BLACKOUT_DIR"; exit 1; }
+
+if [ ! -f "$BLACKOUT_DIR/nodes.json" ]; then
+    echo "[]" > "$BLACKOUT_DIR/nodes.json"
+fi
+if [ ! -f "$BLACKOUT_DIR/proxies.txt" ]; then
+    : > "$BLACKOUT_DIR/proxies.txt"
+fi
+
+ok "Workspace ready"
+
+
+# ============================================================
+# 10. DOWNLOAD MAIN SCRIPT
 # ============================================================
 section "DOWNLOADING MAIN SCRIPT"
 
 RAW_PYTHON_URL="https://raw.githubusercontent.com/coderuseplayer-netizen/subscriptionlink-panel-DoS-ATTACK/main/main.py"
-SCRIPT_DIR="$(pwd)"
-SCRIPT_FILE="run.py"
-FULL_SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_FILE"
-BACKUP_FILE="run.py.bak"
 
-if [ -f "$SCRIPT_FILE" ]; then
+if [ -f "$FULL_SCRIPT_PATH" ]; then
     info "Backing up existing $SCRIPT_FILE -> $BACKUP_FILE"
-    cp "$SCRIPT_FILE" "$BACKUP_FILE"
+    cp "$FULL_SCRIPT_PATH" "$BACKUP_FILE"
     ok "Backup created"
 fi
 
 info "Downloading from repository..."
-if curl -fsSL --connect-timeout 15 --retry 3 "$RAW_PYTHON_URL" -o "$SCRIPT_FILE"; then
-    ok "Downloaded to ${C_BOLD}$SCRIPT_FILE${C_RESET}"
+if curl -fsSL --connect-timeout 15 --retry 3 "$RAW_PYTHON_URL" -o "$FULL_SCRIPT_PATH"; then
+    ok "Downloaded to ${C_BOLD}$FULL_SCRIPT_PATH${C_RESET}"
 else
     err "Failed to download from $RAW_PYTHON_URL"
     if [ -f "$BACKUP_FILE" ]; then
         warn "Restoring from backup..."
-        mv "$BACKUP_FILE" "$SCRIPT_FILE"
+        mv "$BACKUP_FILE" "$FULL_SCRIPT_PATH"
         ok "Using local $SCRIPT_FILE instead"
     else
         err "No backup available and download failed. Aborting."
@@ -348,7 +392,7 @@ else
     fi
 fi
 
-if ! head -1 "$SCRIPT_FILE" | grep -q "python"; then
+if ! head -1 "$FULL_SCRIPT_PATH" | grep -q "python"; then
     warn "Downloaded file doesn't look like a Python script"
     read -p "  Continue anyway? [y/N]: " cont
     if [[ ! "$cont" =~ ^[Yy]$ ]]; then
@@ -356,34 +400,29 @@ if ! head -1 "$SCRIPT_FILE" | grep -q "python"; then
     fi
 fi
 
-chmod +x "$SCRIPT_FILE"
+chmod +x "$FULL_SCRIPT_PATH"
 ok "Script marked as executable"
 
+
 # ============================================================
-# 10. INSTALL 'blackout' COMMAND (background session manager)
+# 11. INSTALL 'blackout' COMMAND
 # ============================================================
 section "INSTALLING 'blackout' COMMAND"
 
-# Decide session name & directory
 SESSION_NAME="blackout"
 BLACKOUT_BIN="/usr/local/bin/blackout"
 
-# Ensure we can write to /usr/local/bin
 if [ ! -w /usr/local/bin ] && [ "$(id -u)" -ne 0 ]; then
     warn "Cannot write to /usr/local/bin without sudo — using ~/.local/bin"
     mkdir -p ~/.local/bin
     BLACKOUT_BIN="$HOME/.local/bin/blackout"
 fi
 
-# Write the blackout command wrapper
 $SUDO tee "$BLACKOUT_BIN" > /dev/null <<EOF
 #!/bin/bash
-# ============================================================
-# blackout — bring the attack script to the foreground
-# ============================================================
 SESSION_NAME="$SESSION_NAME"
 SCRIPT_PATH="$FULL_SCRIPT_PATH"
-SCRIPT_DIR="$SCRIPT_DIR"
+SCRIPT_DIR="$BLACKOUT_DIR"
 TARGET_LIMIT=65535
 
 C_RESET='\033[0m'
@@ -394,33 +433,23 @@ C_GREEN='\033[92m'
 C_YELLOW='\033[93m'
 C_CYAN='\033[96m'
 C_MAGENTA='\033[95m'
+C_BLUE='\033[94m'
 
-# Ensure tmux exists
 if ! command -v tmux >/dev/null 2>&1; then
     echo -e "  \${C_RED}✗\${C_RESET} tmux not installed. Install it: apt install tmux"
     exit 1
 fi
 
-# Parse args
 ACTION="attach"
 case "\$1" in
-    stop)
-        ACTION="stop"
-        ;;
-    status)
-        ACTION="status"
-        ;;
-    restart)
-        ACTION="restart"
-        ;;
-    kill)
-        ACTION="kill"
-        ;;
-    ""|attach)
-        ACTION="attach"
-        ;;
+    stop)     ACTION="stop" ;;
+    status)   ACTION="status" ;;
+    restart)  ACTION="restart" ;;
+    kill)     ACTION="kill" ;;
+    logs)     ACTION="logs" ;;
+    ""|attach) ACTION="attach" ;;
     *)
-        echo "Usage: blackout [attach|stop|status|restart|kill]"
+        echo "Usage: blackout [attach|stop|status|restart|kill|logs]"
         exit 1
         ;;
 esac
@@ -428,7 +457,6 @@ esac
 # ---- STOP ----
 if [ "\$ACTION" = "stop" ]; then
     if tmux has-session -t "\$SESSION_NAME" 2>/dev/null; then
-        # send SIGINT so python handles cleanup
         tmux send-keys -t "\$SESSION_NAME" C-c
         sleep 2
         tmux kill-session -t "\$SESSION_NAME" 2>/dev/null
@@ -443,8 +471,16 @@ fi
 if [ "\$ACTION" = "kill" ]; then
     if tmux has-session -t "\$SESSION_NAME" 2>/dev/null; then
         tmux kill-session -t "\$SESSION_NAME" 2>/dev/null
-        pkill -9 -f "\$SCRIPT_PATH" 2>/dev/null
-        echo -e "  \${C_GREEN}✓\${C_RESET} Session force-killed."
+    fi
+    pkill -9 -f "\$SCRIPT_PATH" 2>/dev/null
+    echo -e "  \${C_GREEN}✓\${C_RESET} Session force-killed."
+    exit 0
+fi
+
+# ---- LOGS (tail recent output) ----
+if [ "\$ACTION" = "logs" ]; then
+    if tmux has-session -t "\$SESSION_NAME" 2>/dev/null; then
+        tmux capture-pane -t "\$SESSION_NAME" -pS -100 | tail -60
     else
         echo -e "  \${C_YELLOW}⚠\${C_RESET} No active session."
     fi
@@ -455,15 +491,41 @@ fi
 if [ "\$ACTION" = "status" ]; then
     echo ""
     echo -e "  \${C_BOLD}\${C_MAGENTA}● BLACKOUT STATUS\${C_RESET}"
-    echo -e "  \${C_DIM}────────────────────────────────────\${C_RESET}"
+    echo -e "  \${C_DIM}────────────────────────────────────────────────\${C_RESET}"
+
     if tmux has-session -t "\$SESSION_NAME" 2>/dev/null; then
         PID=\$(pgrep -f "\$SCRIPT_PATH" | head -1)
-        echo -e "  \${C_GREEN}● ACTIVE\${C_RESET}    session: \$SESSION_NAME"
-        echo -e "  \${C_DIM}├─\${C_RESET} Script    \$SCRIPT_PATH"
-        echo -e "  \${C_DIM}└─\${C_RESET} PID       \${PID:-unknown}"
+        STATE="\${C_GREEN}● ACTIVE\${C_RESET}"
+        echo -e "  \${C_DIM}├─\${C_RESET} Session      \${C_BOLD}\${SESSION_NAME}\${C_RESET}"
+        echo -e "  \${C_DIM}├─\${C_RESET} State        \${STATE}"
+        echo -e "  \${C_DIM}├─\${C_RESET} PID          \${PID:-unknown}"
     else
-        echo -e "  \${C_RED}● STOPPED\${C_RESET}   session: \$SESSION_NAME (not running)"
+        STATE="\${C_RED}● STOPPED\${C_RESET}"
+        echo -e "  \${C_DIM}├─\${C_RESET} Session      \${C_BOLD}\${SESSION_NAME}\${C_RESET}"
+        echo -e "  \${C_DIM}├─\${C_RESET} State        \${STATE}"
+        echo -e "  \${C_DIM}├─\${C_RESET} PID          \${C_DIM}—\${C_RESET}"
     fi
+
+    echo -e "  \${C_DIM}├─\${C_RESET} Folder       \${C_DIM}\${SCRIPT_DIR}\${C_RESET}"
+
+    NODE_CNT=0
+    if [ -f "\${SCRIPT_DIR}/nodes.json" ]; then
+        NODE_CNT=\$(python3 -c "import json; print(len(json.load(open('\${SCRIPT_DIR}/nodes.json'))))" 2>/dev/null || echo 0)
+    fi
+    echo -e "  \${C_DIM}├─\${C_RESET} Nodes        \${C_BOLD}\${NODE_CNT}\${C_RESET} configured"
+
+    PROXY_CNT=0
+    if [ -f "\${SCRIPT_DIR}/proxies.txt" ]; then
+        PROXY_CNT=\$(grep -cve '^[[:space:]]*$' "\${SCRIPT_DIR}/proxies.txt" 2>/dev/null || echo 0)
+    fi
+    echo -e "  \${C_DIM}├─\${C_RESET} Proxies      \${C_BOLD}\${PROXY_CNT}\${C_RESET} loaded"
+
+    WORK_CNT=0
+    if [ -f "\${SCRIPT_DIR}/working_proxies.txt" ]; then
+        WORK_CNT=\$(grep -cve '^[[:space:]]*$' "\${SCRIPT_DIR}/working_proxies.txt" 2>/dev/null || echo 0)
+    fi
+    echo -e "  \${C_DIM}└─\${C_RESET} Working      \${C_GREEN}\${WORK_CNT}\${C_RESET} alive"
+
     echo ""
     exit 0
 fi
@@ -481,20 +543,21 @@ fi
 if ! tmux has-session -t "\$SESSION_NAME" 2>/dev/null; then
     echo -e "  \${C_CYAN}➜\${C_RESET} No session found — starting new one..."
     cd "\$SCRIPT_DIR" || exit 1
-    tmux new-session -d -s "\$SESSION_NAME" "ulimit -n \$TARGET_LIMIT; cd \$SCRIPT_DIR && python3 \$SCRIPT_PATH; exec bash"
+    tmux new-session -d -s "\$SESSION_NAME" "ulimit -n \$TARGET_LIMIT; cd \$SCRIPT_DIR && exec python3 \$SCRIPT_PATH"
     sleep 1
-    echo -e "  \${C_GREEN}✓\${C_RESET} Session '\$SESSION_NAME' started in background."
-    echo -e "  \${C_DIM}Tip: run 'blackout' again to attach.\${C_RESET}"
-    echo ""
+    if tmux has-session -t "\$SESSION_NAME" 2>/dev/null; then
+        echo -e "  \${C_GREEN}✓\${C_RESET} Session '\$SESSION_NAME' started in background."
+    else
+        echo -e "  \${C_RED}✗\${C_RESET} Session exited immediately. Run 'blackout logs' for details."
+        exit 1
+    fi
 fi
 
-# Attach to the session
 exec tmux attach -t "\$SESSION_NAME"
 EOF
 
 $SUDO chmod +x "$BLACKOUT_BIN"
 
-# Add ~/.local/bin to PATH if needed
 if [[ "$BLACKOUT_BIN" == "$HOME/.local/bin/blackout" ]]; then
     if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
         echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
@@ -505,8 +568,9 @@ fi
 
 ok "Installed: ${C_BOLD}$BLACKOUT_BIN${C_RESET}"
 
+
 # ============================================================
-# 11. CREATE SHORTCUT ALIASES
+# 12. CREATE SHORTCUT ALIASES
 # ============================================================
 section "CREATING ALIASES"
 
@@ -522,24 +586,29 @@ alias blackout-stop='blackout stop'
 alias blackout-status='blackout status'
 alias blackout-restart='blackout restart'
 alias blackout-kill='blackout kill'
+alias blackout-logs='blackout logs'
 ALIASEOF
     ok "Aliases added to ~/.bashrc"
 else
     ok "Aliases already configured"
 fi
 
+
 # ============================================================
-# 12. LAUNCH IN BACKGROUND
+# 13. LAUNCH IN BACKGROUND
 # ============================================================
 section "LAUNCHING IN BACKGROUND"
 
-# Start the session
-cd "$SCRIPT_DIR" || exit 1
+cd "$BLACKOUT_DIR" || exit 1
 if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-    tmux new-session -d -s "$SESSION_NAME" "ulimit -n $TARGET_LIMIT; cd $SCRIPT_DIR && python3 $FULL_SCRIPT_PATH; exec bash"
+    tmux new-session -d -s "$SESSION_NAME" "ulimit -n $TARGET_LIMIT; cd $BLACKOUT_DIR && exec python3 $FULL_SCRIPT_PATH"
     sleep 1
-    ok "Session '$SESSION_NAME' started in background"
-    ok "Python script running inside tmux"
+    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        ok "Session '$SESSION_NAME' started in background"
+        ok "Python script running inside tmux"
+    else
+        warn "Session exited immediately — check with 'blackout logs'"
+    fi
 else
     warn "Session '$SESSION_NAME' already exists — skipping start"
 fi
@@ -549,29 +618,32 @@ echo -e "  ${C_BOLD}${C_GREEN}● SETUP COMPLETE${C_RESET}"
 echo -e "  ${C_DIM}├─${C_RESET} Python         ${C_BOLD}$PYVER${C_RESET}"
 echo -e "  ${C_DIM}├─${C_RESET} Socket limit   ${C_BOLD}$(ulimit -n)${C_RESET}"
 echo -e "  ${C_DIM}├─${C_RESET} Locale         ${C_BOLD}${LANG:-unset}${C_RESET}"
+echo -e "  ${C_DIM}├─${C_RESET} Workspace      ${C_BOLD}$BLACKOUT_DIR${C_RESET}"
 echo -e "  ${C_DIM}├─${C_RESET} Script         ${C_BOLD}$FULL_SCRIPT_PATH${C_RESET}"
 echo -e "  ${C_DIM}├─${C_RESET} Session        ${C_BOLD}$SESSION_NAME${C_RESET}"
 echo -e "  ${C_DIM}└─${C_RESET} Status         ${C_GREEN}Running in background${C_RESET}"
 echo ""
 echo -e "  ${C_DIM}────────────────────────────────────────────────────${C_RESET}"
 echo -e "  ${C_BOLD}● HOW TO USE${C_RESET}"
-echo -e "  ${C_DIM}├─${C_RESET} ${C_CYAN}blackout${C_RESET}            → attach to session"
-echo -e "  ${C_DIM}├─${C_RESET} ${C_CYAN}blackout stop${C_RESET}       → stop the attack"
-echo -e "  ${C_DIM}├─${C_RESET} ${C_CYAN}blackout status${C_RESET}     → check status"
-echo -e "  ${C_DIM}├─${C_RESET} ${C_CYAN}blackout restart${C_RESET}    → restart"
+echo -e "  ${C_DIM}├─${C_RESET} ${C_CYAN}blackout${C_RESET}            → attach to attack console"
+echo -e "  ${C_DIM}├─${C_RESET} ${C_CYAN}blackout status${C_RESET}     → show session, nodes & proxies"
+echo -e "  ${C_DIM}├─${C_RESET} ${C_CYAN}blackout logs${C_RESET}       → tail recent session output"
+echo -e "  ${C_DIM}├─${C_RESET} ${C_CYAN}blackout stop${C_RESET}       → graceful stop"
+echo -e "  ${C_DIM}├─${C_RESET} ${C_CYAN}blackout restart${C_RESET}    → restart the attack"
 echo -e "  ${C_DIM}└─${C_RESET} ${C_CYAN}blackout kill${C_RESET}       → force kill"
 echo ""
 echo -e "  ${C_DIM}● SHORTCUTS${C_RESET}"
 echo -e "  ${C_DIM}├─${C_RESET} ${C_CYAN}blackout-stop${C_RESET}"
 echo -e "  ${C_DIM}├─${C_RESET} ${C_CYAN}blackout-status${C_RESET}"
+echo -e "  ${C_DIM}├─${C_RESET} ${C_CYAN}blackout-logs${C_RESET}"
 echo -e "  ${C_DIM}└─${C_RESET} ${C_CYAN}blackout-restart${C_RESET}"
 echo ""
 echo -e "  ${C_DIM}────────────────────────────────────────────────────${C_RESET}"
 echo -e "  ${C_YELLOW}⚠${C_RESET}  Detaching (Ctrl+B then D) keeps it running."
 echo -e "  ${C_YELLOW}⚠${C_RESET}  Closing SSH does NOT kill the attack."
+echo -e "  ${C_YELLOW}⚠${C_RESET}  All runtime files live in: ${C_BOLD}$BLACKOUT_DIR${C_RESET}"
 echo ""
 
-# Reload bashrc in current shell (best-effort)
 hash -r 2>/dev/null || true
 
 echo -e "  ${C_CYAN}➜${C_RESET} To enter the attack console now, run:  ${C_BOLD}blackout${C_RESET}"
