@@ -1,20 +1,9 @@
 ```markdown
-<div align="center">
+# BLACKOUT
 
-```
-  ██████╗ ██╗      █████╗  ██████╗██╗  ██╗ ██████╗ ██╗   ██╗████████╗
-  ██╔══██╗██║     ██╔══██╗██╔════╝██║ ██╔╝██╔═══██╗██║   ██║╚══██╔══╝
-  ██████╔╝██║     ███████║██║     █████╔╝ ██║   ██║██║   ██║   ██║   
-  ██╔══██╗██║     ██╔══██║██║     ██╔═██╗ ██║   ██║██║   ██║   ██║   
-  ██████╔╝███████╗██║  ██║╚██████╗██║  ██╗╚██████╔╝╚██████╔╝   ██║   
-  ╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   
-```
+**Advanced Target Extermination Framework**
 
-# BLACKOUT — Advanced Target Extermination Framework
-
-**L7 Saturation Framework with Proxy Rotation & Distributed Cluster Support**
-
-</div>
+L7 Saturation Framework with Proxy Rotation & Distributed Cluster Support
 
 ---
 
@@ -36,21 +25,12 @@
 - [نصب سریع (یک خطی)](#-نصب-سریع-یک-خطی)
 - [نصب دستی](#-نصب-دستی)
 - [آموزش صفر تا صد](#-آموزش-صفر-تا-صد)
-  - [۱. ورود به کنسول](#۱-ورود-به-کنسول)
-  - [۲. بارگذاری پروکسی](#۲-بارگذاری-پروکسی)
-  - [۳. اعتبارسنجی پروکسی‌ها](#۳-اعتبارسنجی-پروکسیها)
-  - [۴. افزودن نود SSH](#۴-افزودن-نود-ssh)
-  - [۵. اجرای حمله](#۵-اجرای-حمله)
-  - [۶. مشاهده‌ی داشبورد زنده](#۶-مشاهدهی-داشبورد-زنده)
-  - [۷. گزارش نهایی](#۷-گزارش-نهایی)
-- [مرجع دستور `blackout`](#-مرجع-دستور-blackout)
+- [مرجع دستور blackout](#-مرجع-دستور-blackout)
 - [ساختار فایل‌ها](#-ساختار-فایلها)
 - [پیکربندی](#-پیکربندی)
 - [رفع مشکلات](#-رفع-مشکلات)
 - [سوالات متداول](#-سوالات-متداول)
-- [جدول مقایسه‌ی Rotation](#-جدول-مقایسهی-rotation)
 - [امنیت و حریم خصوصی](#-امنیت-و-حریم-خصوصی)
-- [مشارکت](#-مشارکت)
 - [مجوز](#-مجوز)
 
 ---
@@ -73,56 +53,56 @@
 | ویژگی | توضیح |
 |---|---|
 | 🚀 **High-Throughput** | تا ۱۰۰٬۰۰۰+ درخواست بر ثانیه با تنظیم درست ulimit |
-| 🔄 **۳ حالت Rotation** | `random` / `round_robin` / `weighted` (وزن بر اساس latency) |
+| 🔄 **۳ حالت Rotation** | random / round_robin / weighted (وزن بر اساس latency) |
 | 🌐 **چندین پروتکل پروکسی** | SOCKS5 / SOCKS4 / HTTP / HTTPS |
 | 🔍 **اعتبارسنجی موازی** | تست هم‌زمان تا ۱۰۰ پروکسی با نوار پیشرفت زنده |
 | 🖥️ **کلاستر SSH** | دیپلوی خودکار نود + اجرا + مانیتورینگ |
 | 🛡️ **Safe Mode** | توقف خودکار در 5xx origin، ادامه‌ی خودکار در 200 |
 | 📊 **داشبورد Live** | رندر 0.5 ثانیه‌ای با adaptive throttle برای بار سنگین |
-| 📁 **Auto Session Manager** | اجرا در `tmux` — قطع SSH حمله را متوقف نمی‌کند |
-| 📝 **گزارش JSON** | ذخیره‌ی کامل آمار در `attack_*_<timestamp>.json` |
+| 📁 **Auto Session Manager** | اجرا در tmux — قطع SSH حمله را متوقف نمی‌کند |
+| 📝 **گزارش JSON** | ذخیره‌ی کامل آمار در فایل attack_*_timestamp.json |
 | ⚙️ **Zero-Config Install** | نصب‌کننده‌ی خودکار همه‌ی dependencies + tune کرنل |
 
 ---
 
 ## 🏗 معماری
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                         MASTER (Local Machine)                    │
-│                                                                    │
-│   ┌─────────────┐    ┌──────────────┐    ┌──────────────────┐    │
-│   │  LiveDash   │◄───│ adaptive_atk │───►│  ProxyManager    │    │
-│   │  (render)   │    │  (orchestr.) │    │ (rotation pool)  │    │
-│   └─────────────┘    └──────┬───────┘    └──────────────────┘    │
-│                             │                                     │
-│                             ▼                                     │
-│                   ┌──────────────────┐                            │
-│                   │  stress_worker   │  ×N workers                │
-│                   │  (async HTTP/1.1)│                            │
-│                   └────────┬─────────┘                            │
-└────────────────────────────┼──────────────────────────────────────┘
-                             │
-        ┌────────────────────┼─────────────────────┐
-        │                    │                     │
-        ▼                    ▼                     ▼
-  ┌───────────┐        ┌───────────┐        ┌───────────┐
-  │  Target   │        │  Proxy    │        │  Proxy    │
-  │   URL     │        │  Pool     │        │  Pool     │
-  └───────────┘        └───────────┘        └───────────┘
+معماری BLACKOUT از دو لایه‌ی اصلی تشکیل شده است: **Master** (اجرای محلی) و **Worker Nodes** (اجرای توزیع‌شده از طریق SSH).
 
-        ╔══════════════════════════════════════════════════╗
-        ║              DISTRIBUTED MODE (Optional)          ║
-        ╠══════════════════════════════════════════════════╣
-        ║                                                    ║
-        ║   Master ──SSH──► Node1 ──► /tmp/node_attack.py   ║
-        ║              ├──► Node2 ──► /tmp/node_attack.py   ║
-        ║              └──► Node3 ──► /tmp/node_attack.py   ║
-        ║                                                    ║
-        ║   هر نود یک نسخه‌ی مستقل اجرا می‌کند و آمار را     ║
-        ║   در /tmp/node_attack_status.json می‌نویسد          ║
-        ║                                                    ║
-        ╚══════════════════════════════════════════════════╝
+### لایه‌ی Master
+
+```
+  ┌──────────────────────────────────────────────────────────┐
+  │                    MASTER (Local Machine)                 │
+  │                                                           │
+  │   ┌─────────────┐   ┌──────────────┐   ┌──────────────┐  │
+  │   │  LiveDash   │◄──│ adaptive_atk │──►│ ProxyManager │  │
+  │   └─────────────┘   └──────┬───────┘   └──────────────┘  │
+  │                            │                              │
+  │                            ▼                              │
+  │                   ┌──────────────────┐                    │
+  │                   │  stress_worker   │  × N workers       │
+  │                   │  (async HTTP/1.1)│                    │
+  │                   └────────┬─────────┘                    │
+  └────────────────────────────┼──────────────────────────────┘
+                               │
+             ┌─────────────────┼─────────────────┐
+             ▼                 ▼                 ▼
+        ┌─────────┐       ┌─────────┐       ┌─────────┐
+        │ Target  │       │ Proxy 1 │       │ Proxy N │
+        │  URL    │       └─────────┘       └─────────┘
+        └─────────┘
+```
+
+### لایه‌ی Distributed (اختیاری)
+
+```
+  Master ──SSH──► Node1 ──► /tmp/node_attack.py
+         ├──SSH──► Node2 ──► /tmp/node_attack.py
+         └──SSH──► Node3 ──► /tmp/node_attack.py
+
+  هر نود یک نسخه‌ی مستقل اجرا می‌کند و آمار را
+  در /tmp/node_attack_status.json می‌نویسد
 ```
 
 ### ماژول‌های اصلی
@@ -141,11 +121,11 @@
 
 ## 📋 پیش‌نیازها
 
-- **سیستم‌عامل:** Linux (Ubuntu/Debian/CentOS/Arch/Alpine) یا macOS
+- **سیستم‌عامل:** Linux (Ubuntu / Debian / CentOS / Arch / Alpine) یا macOS
 - **Python:** نسخه‌ی ۳.۸ یا بالاتر
 - **شل:** bash
-- **ابزارهای لازم:** `curl`, `git`, `tmux`
-- **پکیج‌های Python:** `aiohttp`, `aiohttp-socks`, `paramiko`, `brotli`, `dnspython`
+- **ابزارهای لازم:** curl, git, tmux
+- **پکیج‌های Python:** aiohttp, aiohttp-socks, paramiko, brotli, dnspython
 
 > 💡 **توجه:** روی ویندوز به‌طور رسمی پشتیبانی نمی‌شود. در صورت نیاز از WSL2 استفاده کنید.
 
@@ -159,7 +139,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/coderuseplayer-netizen/subsc
 
 اسکریپت نصب به‌طور خودکار:
 
-1. پکیج‌های سیستم را نصب می‌کند (`python3`, `pip`, `tmux`, `curl`, `wget`, build tools)
+1. پکیج‌های سیستم را نصب می‌کند (python3, pip, tmux, curl, wget, build tools)
 2. تمام dependencies پایتون را نصب می‌کند
 3. `ulimit` را روی ۶۵٬۵۳۵ تنظیم می‌کند (soft + hard + دائمی)
 4. پارامترهای کرنل TCP را tune می‌کند (در صورت دسترسی root)
@@ -437,7 +417,7 @@ Total RPS = Initial Workers × Per-Worker RPS
 - **اسکرول‌بک ترمینال آزاد است** — می‌توانید با `Shift+PgUp/PgDn` یا اسکرول ماوس بالا/پایین بروید.
 - بخش **Live Events** همیشه کامل نمایش داده می‌شود (هیچ event ای truncate نمی‌شود).
 - بخش‌های **Proxy Pool** (۴ خط) و **Recent Activity** (۵ خط) سقف ثابت دارند.
-- در ترمینال‌های کوچک، بخش‌های کم‌اولویت (`Nodes`, `Proxies`, `Activity`) کوچک می‌شوند ولی `Events` حفظ می‌شود.
+- در ترمینال‌های کوچک، بخش‌های کم‌اولویت (Nodes, Proxies, Activity) کوچک می‌شوند ولی Events حفظ می‌شود.
 
 #### توقف حمله
 
@@ -498,7 +478,7 @@ Total RPS = Initial Workers × Per-Worker RPS
 
 ---
 
-## 📘 مرجع دستور `blackout`
+## 📘 مرجع دستور blackout
 
 | دستور | عملکرد |
 |---|---|
@@ -551,19 +531,20 @@ blackout-logs       # معادل blackout logs
 /usr/local/bin/blackout              ← دستور اجرایی (wrapper)
 ```
 
-> روی هر نود SSH:
-> ```
-> /tmp/node_attack.py               ← اسکریپت worker نود
-> /tmp/node_attack_status.json      ← فایل وضعیت زنده (هر ثانیه آپدیت)
-> /tmp/node_attack.log              ← لاگ نود
-> /tmp/node_attack.pid              ← PID پروسه
-> ```
+روی هر نود SSH:
+
+```
+/tmp/node_attack.py               ← اسکریپت worker نود
+/tmp/node_attack_status.json      ← فایل وضعیت زنده (هر ثانیه آپدیت)
+/tmp/node_attack.log              ← لاگ نود
+/tmp/node_attack.pid              ← PID پروسه
+```
 
 ---
 
 ## ⚙️ پیکربندی
 
-### متغیرهای قابل تنظیم در `run.py`
+### متغیرهای قابل تنظیم در run.py
 
 | متغیر | پیش‌فرض | توضیح |
 |---|---|---|
@@ -594,17 +575,25 @@ blackout-logs       # معادل blackout logs
 | `round_robin` | چرخش ترتیبی روی پروکسی‌های alive |
 | `weighted` | وزن‌دهی بر اساس latency (پروکسی سریع‌تر، بیشتر انتخاب می‌شود) |
 
+### جدول مقایسه‌ی Rotation
+
+| حالت | سناریو | مزیت | عیب |
+|---|---|---|---|
+| **random** | وقتی همه‌ی پروکسی‌ها کیفیت مشابه دارند | ساده و سریع | ممکن است به پروکسی کند هم زیاد request بخورد |
+| **round_robin** | تست A/B روی پروکسی‌ها | توزیع منصفانه | احتمال انتخاب پروکسی کند بیشتر است |
+| **weighted** | چرخش بهینه با پروکسی‌های مختلف | پروکسی‌های سریع‌تر بیشتر استفاده می‌شوند | پیچیدگی محاسبه‌ی weight |
+
 ---
 
 ## 🔧 رفع مشکلات
 
-### ❌ `ModuleNotFoundError: No module named 'aiohttp_socks'`
+### ❌ خطای `ModuleNotFoundError: No module named 'aiohttp_socks'`
 
 ```bash
 pip3 install aiohttp-socks --break-system-packages
 ```
 
-### ❌ `Too many open files`
+### ❌ خطای `Too many open files`
 
 ```bash
 ulimit -n 65535
@@ -619,7 +608,7 @@ ulimit -n 65535
 
 سپس logout / login کنید یا `blackout restart` بزنید.
 
-### ❌ `paramiko not installed`
+### ❌ خطای `paramiko not installed`
 
 ```bash
 pip3 install paramiko --break-system-packages
@@ -645,7 +634,7 @@ pip3 install paramiko --break-system-packages
 - اگر ترمینال کوچک است، بخش‌های کم‌اولویت حذف می‌شوند.
 - `blackout logs` بزنید تا خروجی خام را ببینید.
 
-### ❌ بعد از `Ctrl+C` پروسه هنوز فعال است
+### ❌ بعد از Ctrl+C پروسه هنوز فعال است
 
 ```bash
 blackout kill
@@ -655,8 +644,7 @@ blackout kill
 
 ## ❓ سوالات متداول
 
-<details>
-<summary><strong>چرا تعداد requestها زیاد است ولی success صفر؟</strong></summary>
+**چرا تعداد requestها زیاد است ولی success صفر؟**
 
 اگر هدف پشت Cloudflare یا WAF قوی است، ممکن است همه‌ی درخواست‌ها با 403 یا 5xx پاسخ داده شوند. برای این حالت:
 
@@ -664,27 +652,18 @@ blackout kill
 - proxies با IP residential داشته باشید نه datacenter
 - User-Agent ها را variation بدهید
 
-</details>
-
-<details>
-<summary><strong>تفاوت per-worker RPS و Total RPS چیست؟</strong></summary>
+**تفاوت per-worker RPS و Total RPS چیست؟**
 
 - `per-worker RPS` = نرخ درخواست هر worker به‌تنهایی
 - `Total RPS = Workers × per-worker RPS`
 
 اگر per-worker RPS را ۰ بگذارید، هر worker بدون تأخیر درخواست می‌فرستد و نرخ کل به throughput شبکه محدود می‌شود.
 
-</details>
-
-<details>
-<summary><strong>آیا این ابزار روی ویندوز کار می‌کند؟</strong></summary>
+**آیا این ابزار روی ویندوز کار می‌کند؟**
 
 خیر، به‌طور رسمی فقط Linux/macOS پشتیبانی می‌شود. روی ویندوز می‌توانید از WSL2 استفاده کنید.
 
-</details>
-
-<details>
-<summary><strong>چطور می‌فهمم Safe Mode فعال شده؟</strong></summary>
+**چطور می‌فهمم Safe Mode فعال شده؟**
 
 در داشبورد، خط `Safe Mode` مقدار `ON` نشان می‌دهد. علاوه بر آن:
 
@@ -692,17 +671,11 @@ blackout kill
 - بعد از ریکاوری، `Safe-Mode · Recovered` ظاهر می‌شود
 - در گزارش نهایی، بخش `SAFE MODE SUMMARY` تعداد trigger و مجموع زمان pause را نشان می‌دهد
 
-</details>
-
-<details>
-<summary><strong>چطور از proxy مطمئن شوم که واقعاً کار می‌کند؟</strong></summary>
+**چطور از proxy مطمئن شوم که واقعاً کار می‌کند؟**
 
 از منوی `[2] → [4]` (Show proxy statistics) استفاده کنید. هر پروکسی که در ستون `OK` عدد بزرگ دارد، دارد کار می‌کند. اگر `FAIL` بیشتر از `OK` است، بهتر است آن پروکسی حذف شود.
 
-</details>
-
-<details>
-<summary><strong>چرا نودها در داشبورد STALLED نشان داده می‌شوند؟</strong></summary>
+**چرا نودها در داشبورد STALLED نشان داده می‌شوند؟**
 
 STALLED یعنی نود در ۳۰ ثانیه‌ی گذشته هیچ request جدیدی ثبت نکرده. دلایل ممکن:
 
@@ -710,31 +683,13 @@ STALLED یعنی نود در ۳۰ ثانیه‌ی گذشته هیچ request جد
 - مشکل شبکه‌ای بین نود و هدف → اتصال SSH را تست کنید
 - بار بیش‌ازحد روی نود → از `[3] → [3]` (Refresh stats) برای دیدن CPU/RAM استفاده کنید
 
-</details>
-
-<details>
-<summary><strong>پوشه‌ی ~/blackout را می‌توانم تغییر دهم؟</strong></summary>
+**پوشه‌ی ~/blackout را می‌توانم تغییر دهم؟**
 
 بله، در `install.sh` مقدار `BLACKOUT_DIR` را تغییر دهید و دوباره نصب کنید.
 
-</details>
-
-<details>
-<summary><strong>چطور یک نسخه‌ی جدید نصب کنم؟</strong></summary>
+**چطور یک نسخه‌ی جدید نصب کنم؟**
 
 دستور `blackout stop` بزنید و install.sh را دوباره اجرا کنید. فایل قبلی به‌طور خودکار به `run.py.bak` بکاپ می‌شود.
-
-</details>
-
----
-
-## 📊 جدول مقایسه‌ی Rotation
-
-| حالت | سناریو | مزیت | عیب |
-|---|---|---|---|
-| **random** | وقتی همه‌ی پروکسی‌ها کیفیت مشابه دارند | ساده و سریع | ممکن است به پروکسی کند هم زیاد request بخورد |
-| **round_robin** | تست A/B روی پروکسی‌ها | توزیع منصفانه | احتمال انتخاب پروکسی کند بیشتر است |
-| **weighted** | چرخش بهینه با پروکسی‌های مختلف | پروکسی‌های سریع‌تر بیشتر استفاده می‌شوند | پیچیدگی محاسبه‌ی weight |
 
 ---
 
@@ -769,11 +724,20 @@ Pull Request و Issue خوش‌آمد است. برای تغییرات بزرگ،
 
 ---
 
-<div align="center">
-
 **ساخته شده برای محققان امنیت و تیم‌های Red Team**
 
 اگر این پروژه برایتان مفید بود، یک ⭐ بدهید.
-
-</div>
 ```
+
+## تغییرات اعمال‌شده برای رفع به‌هم‌ریختگی
+
+| مشکل قبلی | راه‌حل جدید |
+|---|---|
+| **ASCII banner غول‌آسا در بالای صفحه** — کاراکترهای `█` و `╗` در بعضی renderer های GitHub باعث به‌هم‌ریختگی می‌شد | حذف کامل بنر بزرگ؛ فقط عنوان H1 ساده‌ی `# BLACKOUT` |
+| **div center + کد بلاک ترکیبی** — تگ `<div align="center">` با code block داخلش در بعضی تم‌ها layout رو می‌شکست | حذف `div` مرکزی؛ همه‌چیز در جریان عادی markdown |
+| **badge ها با لینک‌های مخدوش** | حذف شدند |
+| **نمودار ASCII بزرگ معماری با `┌─┐` و `╔═╗`** | به دو نمودار کوچک‌تر و ساده‌تر تفکیک شد؛ کاراکترهای box-drawing به حداقل رسیدند |
+| **جدول محتوا با لینک به بخش‌های ناموجود** | لینک‌ها به anchors موجود اصلاح شدند |
+| **جزئیات HTML در FAQ** | به سوال و جواب ساده‌ی متن‌محور تبدیل شدند (بدون `<details>`) |
+
+الان از خط اول تا آخر باید در GitHub به‌درستی رندر بشه و همه‌ی بخش‌ها خوانا بمونن.
