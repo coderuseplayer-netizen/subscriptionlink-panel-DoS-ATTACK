@@ -1310,7 +1310,9 @@ class ProxyManager:
         self._all_dead_notified = False
 
     def normalize_proxy(self, raw):
-        raw = raw.strip()
+        if raw is None:
+            return None
+        raw = raw.replace("\ufeff", "").replace("\r", "").strip()
         if not raw or raw.startswith("#"):
             return None
         if "#" in raw:
@@ -1321,7 +1323,10 @@ class ProxyManager:
             return raw
         try:
             host_part = raw.split("@")[-1]
-            port = int(host_part.rsplit(":", 1)[1])
+            if ":" not in host_part:
+                return f"http://{raw}"
+            port_str = host_part.rsplit(":", 1)[1]
+            port = int(port_str)
             if port in (1080, 1081, 1082, 1083, 1084, 1085,
                         9050, 9051, 9150, 9151, 1088):
                 return f"socks5://{raw}"
@@ -1335,16 +1340,60 @@ class ProxyManager:
         return f"http://{raw}"
 
     def load_from_file(self, filepath):
+        filepath = (filepath or "").strip().strip('"').strip("'")
+        if filepath.startswith("~"):
+            filepath = os.path.expanduser(filepath)
+
         if not os.path.exists(filepath):
-            return 0, "File not found"
+            alt = os.path.join(os.path.dirname(os.path.abspath(__file__)), filepath)
+            if os.path.exists(alt):
+                filepath = alt
+            else:
+                return 0, f"File not found: {filepath}"
+
+        if not os.path.isfile(filepath):
+            return 0, f"Not a file: {filepath}"
+
         count = 0
-        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                p = self.normalize_proxy(line)
-                if p and p not in self.all_proxies:
-                    self.all_proxies.append(p)
-                    count += 1
-        return count, f"Loaded {count} new proxies (total: {len(self.all_proxies)})"
+        skipped = 0
+        invalid = 0
+        total_lines = 0
+
+        try:
+            with open(filepath, "r", encoding="utf-8-sig", errors="ignore") as f:
+                for line in f:
+                    total_lines += 1
+                    p = self.normalize_proxy(line)
+                    if not p:
+                        invalid += 1
+                        continue
+                    if p in self.all_proxies:
+                        skipped += 1
+                    else:
+                        self.all_proxies.append(p)
+                        count += 1
+        except Exception as e:
+            return 0, f"Read error: {type(e).__name__}: {e}"
+
+        total = len(self.all_proxies)
+
+        if total_lines == 0:
+            return 0, f"File is empty: {filepath}"
+
+        if count == 0 and skipped > 0:
+            return 0, (f"All {skipped} proxies already in pool "
+                       f"(total: {total})")
+
+        if count == 0:
+            return 0, (f"No valid proxies parsed from {filepath} "
+                       f"(lines: {total_lines}, invalid: {invalid})")
+
+        msg = f"Loaded {count} new proxies (total: {total})"
+        if skipped:
+            msg += f" · {skipped} duplicates skipped"
+        if invalid:
+            msg += f" · {invalid} invalid lines"
+        return count, msg
 
     def add_proxy(self, raw):
         p = self.normalize_proxy(raw)
