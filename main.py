@@ -941,19 +941,7 @@ class LiveDashboard:
             f"  {Colors.BOLD}{Colors.MAGENTA}● NODE CLUSTER{Colors.RESET}  "
             f"{Colors.DIM}({len(self.nodes)} nodes · {attacking} active){Colors.RESET}"
         )
-        row_budget = budget - 2
-        if row_budget < 1:
-            return lines + [""]
-
-        show_count = min(len(self.nodes), row_budget)
-        needs_more = len(self.nodes) > show_count
-        if needs_more and show_count > 0:
-            show_count -= 1
-
-        shown = self.nodes[:show_count]
-        for i, n in enumerate(shown):
-            is_last = (i == len(shown) - 1) and not needs_more
-            prefix = "└─" if is_last else "├─"
+        for n in self.nodes:
             req = getattr(n, "live_requests", 0)
             ok = getattr(n, "live_success", 0)
             to = getattr(n, "live_timeouts", 0)
@@ -975,19 +963,12 @@ class LiveDashboard:
                 label = label[:19] + "..."
 
             lines.append(
-                f"  {Colors.DIM}{prefix}{Colors.RESET} "
+                f"  {Colors.DIM}├─{Colors.RESET} "
                 f"{label:<22}  "
                 f"REQ {req:>8,}  "
                 f"{Colors.GREEN}OK {ok:>7,}{Colors.RESET}  "
                 f"{Colors.RED}TO {to:>7,}{Colors.RESET}  "
                 f"{Colors.RED}5xx {se:>6,}{Colors.RESET}  [{st}]"
-            )
-
-        if needs_more:
-            remaining = len(self.nodes) - show_count
-            lines.append(
-                f"  {Colors.DIM}└─{Colors.RESET} "
-                f"{Colors.DIM}... and {remaining} more nodes{Colors.RESET}"
             )
         lines.append("")
         return lines
@@ -1111,6 +1092,7 @@ class LiveDashboard:
         ACTIVITY_FIXED = 7
 
         events_need = (len(self.events) + 2) if self.events else 0
+        nodes_need = (len(self.nodes) + 2) if self.nodes else 0
 
         header = HEADER_MIN
         attack = ATTACK_FULL
@@ -1118,9 +1100,11 @@ class LiveDashboard:
         proxies = PROXIES_FIXED
         activity = ACTIVITY_FIXED
         events = events_need
+        nodes = nodes_need
 
         def total():
-            return header + attack + footer + proxies + activity + events
+            return (header + attack + footer + proxies +
+                    activity + events + nodes)
 
         if total() > total_rows:
             excess = total() - total_rows
@@ -1149,13 +1133,8 @@ class LiveDashboard:
             "proxies": proxies,
             "activity": activity,
             "events": events,
-            "nodes": 0,
+            "nodes": nodes,
         }
-
-        remaining = max(0, total_rows - total())
-        if remaining >= 2:
-            budgets["nodes"] = remaining
-
         return budgets
 
     def render(self, force=False):
